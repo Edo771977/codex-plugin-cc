@@ -76,6 +76,10 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  // Sockets whose request is a broker/shutdown: two racing session-end hooks
+  // must not count each other as busy clients, or both back off and the idle
+  // broker leaks with no future event to retire it.
+  const shutdownRequesters = new Set();
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -106,6 +110,10 @@ async function main() {
   }
 
   async function shutdown(server, responseSocket = null) {
+    // Stop admitting new clients before anything else: the app-server close
+    // below can take a while, and a worker admitted during it would have its
+    // turn torn down despite the busy gate having passed.
+    const serverClosed = new Promise((resolve) => server.close(resolve));
     for (const socket of sockets) {
       if (socket === responseSocket) {
         socket.destroySoon();
@@ -114,7 +122,7 @@ async function main() {
       }
     }
     await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
+    await serverClosed;
     if (listenTarget.kind === "unix") {
       removeFileIfExists(listenTarget.path);
     }
@@ -166,10 +174,31 @@ async function main() {
         }
 
         if (message.id !== undefined && message.method === "broker/shutdown") {
+          shutdownRequesters.add(socket);
           if (message.params?.instanceToken !== instanceToken) {
             send(socket, {
               id: message.id,
               error: buildJsonRpcError(-32003, "Broker shutdown identity did not match this instance.")
+            });
+            continue;
+          }
+          // Teardown must be atomic with client admission: a client that
+          // connected between a session-end guard check and this shutdown
+          // request must not have the broker killed under it — including a
+          // worker that is between requests, when the per-request
+          // serialization variables are momentarily clear. Peer shutdown
+          // requesters are not work and never count as busy.
+          let busyWithAnotherConnection = false;
+          for (const other of sockets) {
+            if (other !== socket && !other.destroyed && !shutdownRequesters.has(other)) {
+              busyWithAnotherConnection = true;
+              break;
+            }
+          }
+          if (busyWithAnotherConnection) {
+            send(socket, {
+              id: message.id,
+              error: buildJsonRpcError(BROKER_BUSY_RPC_CODE, "Shared Codex broker is busy.")
             });
             continue;
           }
@@ -242,11 +271,13 @@ async function main() {
 
     socket.on("close", () => {
       sockets.delete(socket);
+      shutdownRequesters.delete(socket);
       clearSocketOwnership(socket);
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
+      shutdownRequesters.delete(socket);
       clearSocketOwnership(socket);
     });
   });

@@ -6,8 +6,7 @@ import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-
-import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { BROKER_BUSY_RPC_CODE, createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import {
   ensurePrivateDir,
   PRIVATE_DIR_MODE,
@@ -30,6 +29,8 @@ import {
 import { resolveStateDir } from "./state.mjs";
 
 const BROKER_STATE_FILE = "broker.json";
+export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
+export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
 
 function createBrokerSessionDir(prefix = "cxc-") {
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -88,25 +89,42 @@ async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   return false;
 }
 
-export function sendBrokerShutdown(endpoint, options = {}) {
+export async function sendBrokerShutdown(endpoint, options = {}) {
+  const first = await sendBrokerShutdownOnce(endpoint, options);
+  if (!first.refused) {
+    return first;
+  }
+  // Two racing session-end hooks can refuse each other before the broker has
+  // marked either as a shutdown requester; back off briefly and retry once.
+  // If the peer's shutdown won, the retry reports unreachable and teardown
+  // proceeds; a genuinely busy broker refuses again.
+  await new Promise((resolve) => setTimeout(resolve, 150 + Math.floor(Math.random() * 150)));
+  return await sendBrokerShutdownOnce(endpoint, options);
+}
+
+async function sendBrokerShutdownOnce(endpoint, options = {}) {
   const timeoutMs = Number.isFinite(options.timeoutMs)
     ? Math.max(1, options.timeoutMs)
     : 2000;
-  return new Promise((resolve) => {
+  return await new Promise((resolve) => {
     const socket = connectToEndpoint(endpoint);
     let settled = false;
     let buffer = "";
-    const finish = (result = null) => {
+    let connected = false;
+    const finish = (outcome) => {
       if (settled) {
         return;
       }
       settled = true;
       socket.destroy();
-      resolve(result);
+      resolve(outcome);
     };
     socket.setEncoding("utf8");
-    socket.setTimeout(timeoutMs, () => finish(null));
+    socket.setTimeout(timeoutMs, () =>
+      finish({ result: null, error: null, delivered: false, refused: false, unreachable: !connected })
+    );
     socket.on("connect", () => {
+      connected = true;
       socket.write(
         `${JSON.stringify({
           id: 1,
@@ -121,15 +139,35 @@ export function sendBrokerShutdown(endpoint, options = {}) {
       if (newlineIndex === -1) {
         return;
       }
+      let response;
       try {
-        const response = JSON.parse(buffer.slice(0, newlineIndex));
-        finish({ result: response?.result ?? null, error: response?.error ?? null });
+        response = JSON.parse(buffer.slice(0, newlineIndex));
       } catch {
-        finish(null);
+        socket.end();
+        finish({ result: null, error: null, delivered: false, refused: false, unreachable: false });
+        return;
       }
+      // The broker refuses shutdown while another connection is mid-turn,
+      // so a shutdown that raced a fresh turn admission cannot kill it.
+      const refused = response?.error?.code === BROKER_BUSY_RPC_CODE;
+      socket.end();
+      finish({
+        result: response?.result ?? null,
+        error: response?.error ?? null,
+        delivered: !refused,
+        refused,
+        unreachable: false
+      });
     });
-    socket.on("error", () => finish(null));
-    socket.on("close", () => finish(null));
+    // A connection lost mid-exchange is ambiguous: the broker may be alive
+    // and busy but its refusal reply was lost. Only a failure to connect at
+    // all marks the broker unreachable (safe to reap).
+    socket.on("error", () =>
+      finish({ result: null, error: null, delivered: false, refused: false, unreachable: !connected })
+    );
+    socket.on("close", () =>
+      finish({ result: null, error: null, delivered: false, refused: false, unreachable: !connected })
+    );
   });
 }
 
