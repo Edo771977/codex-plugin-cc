@@ -285,6 +285,24 @@ Your configuration will be picked up based on:
 
 Check out the Codex docs for more [configuration options](https://developers.openai.com/codex/config-reference).
 
+### Background Runtime Limits
+
+Background tasks and reviews run through a shared, workspace-local broker process that outlives the Claude session that started it. A few environment variables bound how long different parts of that runtime are allowed to stay alive; all default to sensible values and accept `0` to disable the limit entirely.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CODEX_BROKER_IDLE_SHUTDOWN_MS` | 10 minutes | How long the shared broker may sit with no connected client before shutting itself down. |
+| `CODEX_BROKER_STARTUP_TIMEOUT_MS` | 5 minutes | How long the broker may spend starting up (spawning its app-server and MCP servers) before it gives up and tears itself down. |
+| `CODEX_TASK_WORKER_TTL_MS` | 24 hours | Ceiling on a detached background task's wall-clock lifetime — a runaway guard, not a task deadline. |
+
+Set any of these in the environment before starting Claude Code, for example:
+
+```bash
+export CODEX_BROKER_IDLE_SHUTDOWN_MS=1800000  # 30 minutes
+```
+
+These are advanced knobs for tuning resource usage in long-running or resource-constrained environments; most users will never need to touch them.
+
 ### Moving The Work Over To Codex
 
 Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
