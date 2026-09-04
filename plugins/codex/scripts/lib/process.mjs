@@ -58,12 +58,12 @@ export function binaryAvailable(command, versionArgs = ["--version"], options = 
   return { available: true, detail: result.stdout.trim() || result.stderr.trim() || "ok" };
 }
 
-export function isPidAlive(pid) {
-  if (!Number.isFinite(pid)) {
+export function isPidAlive(pid, killImpl = process.kill.bind(process)) {
+  if (!Number.isFinite(pid) || pid <= 0) {
     return false;
   }
   try {
-    process.kill(pid, 0);
+    killImpl(pid, 0);
     return true;
   } catch (error) {
     // EPERM means the pid exists but belongs to another user.
@@ -384,6 +384,41 @@ export function processHasLaunchToken(pid, token, options = {}) {
     return false;
   }
   return commandLine.includes(marker) && commandLine.includes(token);
+}
+
+/**
+ * Terminate a process tree and make sure it is actually gone.
+ *
+ * `terminateProcessTree` sends SIGTERM and stops there, so a descendant that traps or ignores it
+ * survives — and when the tree being terminated is our own, we die with the signal and nothing is
+ * left to escalate. This keeps the caller alive through its own SIGTERM, gives the tree a grace
+ * period to leave on its own, then kills what remains and exits.
+ *
+ * Only meaningful for a group leader; a caller that is not one signals nothing, which is the
+ * existing behaviour of `terminateProcessTree`.
+ */
+export function terminateProcessTreeAndExit(pid, { graceMs = 5000, exitCode = 1, beforeKill } = {}) {
+  if (pid === process.pid) {
+    process.on("SIGTERM", () => {});
+  }
+  terminateProcessTree(pid);
+  // Deliberately not unref'd: this timer is the escalation, and the process must stay up for it.
+  setTimeout(() => {
+    // Surviving our own SIGTERM means ordinary work keeps running during the grace period and can
+    // record an outcome of its own. This is the last moment before the group dies, so a caller
+    // that needs the final say gets it here.
+    try {
+      beforeKill?.();
+    } catch {
+      // Never let bookkeeping stop the kill.
+    }
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // Nothing left in the group, or the caller was never its leader.
+    }
+    process.exit(exitCode);
+  }, graceMs);
 }
 
 export function terminateProcessTree(pid, options = {}) {

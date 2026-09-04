@@ -18,6 +18,7 @@ import {
 import { withLock } from "./locking.mjs";
 import {
   getProcessIdentity,
+  isPidAlive,
   isProcessRunning,
   isProcessTreeRunning,
   isValidPid,
@@ -171,7 +172,7 @@ async function sendBrokerShutdownOnce(endpoint, options = {}) {
   });
 }
 
-function spawnBrokerProcess({
+export function spawnBrokerProcess({
   scriptPath,
   cwd,
   endpoint,
@@ -183,6 +184,9 @@ function spawnBrokerProcess({
   const logFd = fs.openSync(logFile, "a", PRIVATE_FILE_MODE);
   try {
     setMode(logFile, PRIVATE_FILE_MODE);
+    // The broker is told its own log path, not just handed the descriptor: it has to be able to
+    // clean up after itself without consulting the shared session record, which may by then name a
+    // successor.
     const child = spawn(
       process.execPath,
       [
@@ -194,6 +198,8 @@ function spawnBrokerProcess({
         cwd,
         "--pid-file",
         pidFile,
+        "--log-file",
+        logFile,
         "--instance-token",
         instanceToken
       ],
@@ -242,7 +248,7 @@ export function saveBrokerSession(cwd, session) {
   writeJsonFileAtomic(resolveBrokerStateFile(cwd), session);
 }
 
-function clearBrokerSession(cwd) {
+export function clearBrokerSession(cwd) {
   removeFileIfExists(resolveBrokerStateFile(cwd));
 }
 
@@ -282,6 +288,17 @@ function endpointArtifactExists(endpoint) {
   } catch {
     return true;
   }
+}
+
+/**
+ * Whether something is actually listening on a persisted endpoint, as opposed to merely recorded.
+ *
+ * A real connection attempt, not a filesystem check: endpointArtifactExists() only recognizes a
+ * Unix socket path and always reports false for a Windows named pipe, which has no filesystem
+ * artifact at all.
+ */
+export async function isBrokerEndpointReady(endpoint) {
+  return waitForBrokerEndpoint(endpoint, 150);
 }
 
 function canDiscardUnownedSession(session, pid, options = {}) {
@@ -593,7 +610,15 @@ async function ensureBrokerSessionLocked(cwd, options = {}) {
     return existing;
   }
 
-  if (existing) {
+  // Only reclaim a broker we can prove is gone. The probe above waits 150ms, which a live but busy
+  // broker can miss, and forcing a shutdown here on that alone would kill (or orphan) a broker that
+  // another, unrelated session is still using — the ownership-verified teardown below can force a
+  // kill once `options.killProcess` is set, so this gate keeps that path from firing on a broker
+  // that only failed to answer within 150ms.
+  //
+  // A live one is left exactly as it is. Once the replacement below takes over it has no clients,
+  // so its own idle shutdown reclaims both the process and its files.
+  if (existing && !isPidAlive(existing.pid)) {
     await shutdownBrokerSessionLocked(cwd, shutdownOptions);
   }
 
@@ -714,7 +739,7 @@ function teardownAndClear(cwd, session, endpointIsOurs) {
   clearBrokerSession(cwd);
 }
 
-function teardownBrokerSession({
+export function teardownBrokerSession({
   endpoint = null,
   pidFile,
   logFile,
