@@ -399,7 +399,8 @@ async function executeReviewRun(request) {
       turnId: result.turnId,
       payload,
       rendered,
-      summary: firstMeaningfulLine(result.reviewText, `${reviewName} completed.`),
+      summary: shorten(firstMeaningfulLine(result.reviewText, `${reviewName} completed.`), 96),
+      errorMessage: result.error?.message ?? result.stderr ?? null,
       jobTitle: `Codex ${reviewName}`,
       jobClass: "review",
       targetLabel: target.label
@@ -419,6 +420,7 @@ async function executeReviewRun(request) {
     status: result.status,
     failureMessage: result.error?.message ?? result.stderr
   });
+  const failureMessage = result.error?.message ?? result.stderr ?? parsed.parseError ?? "";
   const payload = {
     review: reviewName,
     target,
@@ -450,7 +452,8 @@ async function executeReviewRun(request) {
       targetLabel: context.target.label,
       reasoningSummary: result.reasoningSummary
     }),
-    summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
+    summary: parsed.parsed?.summary ?? shorten(firstMeaningfulLine(failureMessage || result.finalMessage, `${reviewName} finished.`), 96),
+    errorMessage: failureMessage || null,
     jobTitle: `Codex ${reviewName}`,
     jobClass: "review",
     targetLabel: context.target.label
@@ -515,6 +518,10 @@ async function executeTaskRun(request) {
     touchedFiles: result.touchedFiles,
     reasoningSummary: result.reasoningSummary
   };
+  const summary = shorten(
+    firstMeaningfulLine(failureMessage || rawOutput, `${taskMetadata.title} finished.`),
+    96
+  );
 
   return {
     exitStatus: result.status,
@@ -522,7 +529,8 @@ async function executeTaskRun(request) {
     turnId: result.turnId,
     payload,
     rendered,
-    summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
+    summary,
+    errorMessage: failureMessage || null,
     jobTitle: taskMetadata.title,
     jobClass: "task",
     write: Boolean(request.write)

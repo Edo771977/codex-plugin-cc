@@ -536,7 +536,7 @@ function applyTurnNotification(state, message) {
       break;
     case "error":
       state.error = message.params.error;
-      emitProgress(state.onProgress, `Codex error: ${message.params.error.message}`, "failed");
+      emitProgress(state.onProgress, `Codex error: ${shorten(message.params.error.message, 96)}`, "failed");
       break;
     case "turn/completed":
       if ((message.params.threadId ?? null) !== state.threadId) {
