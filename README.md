@@ -420,6 +420,8 @@ Broker and background-job lifecycle:
 | [#659](https://github.com/openai/codex-plugin-cc/pull/659) | state written under one `CLAUDE_PLUGIN_DATA` root is no longer invisible to an invocation that resolves to another, which orphaned brokers and hid jobs |
 | [#707](https://github.com/openai/codex-plugin-cc/pull/707) | the broker releases its app-server thread subscriptions when a client disconnects, instead of leaking them for its whole lifetime |
 | [#728](https://github.com/openai/codex-plugin-cc/pull/728) | a job whose worker died no longer reads as "running" forever; `/codex:status` reconciles the record against the live process |
+| [#725](https://github.com/openai/codex-plugin-cc/pull/725) | nothing is spawned through the user's shell on Windows, where MSYS path conversion mangled switches like `taskkill /PID` and left background workers unkillable under Git Bash (this supersedes [#735](https://github.com/openai/codex-plugin-cc/pull/735)) |
+| [#656](https://github.com/openai/codex-plugin-cc/pull/656) | `/codex:cancel` exits non-zero when neither the turn interrupt nor the worker kill confirmed the job stopped, instead of reporting a cancellation nothing proved |
 
 Commands and flags:
 
@@ -460,16 +462,9 @@ Beyond the imports, this fork carries fixes for defects the imports themselves s
 - disabling the review gate is not outvoted by a stale enable left under another plugin-data root
 - `CLAUDE_ENV_FILE` is only ever appended to: it is shared with other plugins' hooks, and rewriting
   it dropped whatever they had just written
-- on Windows nothing is spawned through the user's shell any more, so MSYS path conversion can no
-  longer mangle a switch like `taskkill /PID` — which had left background workers unkillable under
-  Git Bash ([#725](https://github.com/openai/codex-plugin-cc/pull/725), which also supersedes
-  [#735](https://github.com/openai/codex-plugin-cc/pull/735))
-- `/codex:cancel` exits non-zero when neither the turn interrupt nor the worker kill confirmed the
-  job stopped, instead of reporting a cancellation nothing proved
-  ([#656](https://github.com/openai/codex-plugin-cc/pull/656))
-- teardown on Windows no longer signals a negative pid (a process group is POSIX-only; there it is
-  just an invalid handle, and the fallback killed the worker while its app-server subtree kept
-  running) — `taskkill /T /F` walks the tree instead
+- teardown never force-kills through a negative pid: a process group is POSIX-only, so on Windows
+  that was an invalid handle and the fallback killed the worker alone, leaving its app-server — and
+  every MCP server under it — running. `taskkill /T /F` walks the tree there instead
 - a state write that Windows briefly refuses — a scanner or indexer holding the file open, which
   surfaces as `EPERM`/`EBUSY` on the replacing rename — is retried instead of losing the record
 - the app-server typecheck (`npm run build`) passes
