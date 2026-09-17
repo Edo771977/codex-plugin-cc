@@ -3,7 +3,7 @@
   "version": "1.0.6",
   "private": true,
   "type": "module",
-  "description": "Use Codex from Claude Code to review code or delegate tasks.",
+  "description": "Use Codex from Claude Code to review code or delegate tasks. Fork of openai/codex-plugin-cc with open upstream fixes merged.",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=18.18.0"

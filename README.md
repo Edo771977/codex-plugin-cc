@@ -364,6 +364,9 @@ Broker and background-job lifecycle:
 | [#541](https://github.com/openai/codex-plugin-cc/pull/541) | broker leaks, state races, and signal-masked command failures in the test runtime |
 | [#623](https://github.com/openai/codex-plugin-cc/pull/623) | session end no longer tears down the shared broker while another session's jobs are still using it |
 | [#652](https://github.com/openai/codex-plugin-cc/pull/652) | bounds the lifetime of detached brokers and task workers (see [Background Runtime Limits](#background-runtime-limits)) |
+| [#659](https://github.com/openai/codex-plugin-cc/pull/659) | state written under one `CLAUDE_PLUGIN_DATA` root is no longer invisible to an invocation that resolves to another, which orphaned brokers and hid jobs |
+| [#707](https://github.com/openai/codex-plugin-cc/pull/707) | the broker releases its app-server thread subscriptions when a client disconnects, instead of leaking them for its whole lifetime |
+| [#728](https://github.com/openai/codex-plugin-cc/pull/728) | a job whose worker died no longer reads as "running" forever; `/codex:status` reconciles the record against the live process |
 
 Commands and flags:
 
@@ -383,6 +386,21 @@ Commands and flags:
 
 Where two of these PRs disagreed, the merge commit says which side won and why. The plugin version
 is deliberately left at the upstream number: these merges do not cut a release.
+
+Beyond the imports, this fork carries fixes for defects the imports themselves surfaced:
+
+- a busy broker refusing shutdown is reported as a refusal, not an identity rejection, so SessionEnd
+  leaves a shared runtime to the sessions still using it instead of exiting with an error
+- `scripts/run-node.sh` prefers a user-managed toolchain over a system install, which [#737](https://github.com/openai/codex-plugin-cc/pull/737)
+  had inverted (see the note under [Requirements](#requirements))
+- the durable review-gate config is written privately and atomically, so an interrupted write cannot
+  silently disable the gate
+- the app-server typecheck (`npm run build`) passes
+
+Not imported: [#733](https://github.com/openai/codex-plugin-cc/pull/733) (durable startup
+cancellation) — its behavior is already covered here by the terminal-claim mechanism, and its marker
+files would add a second source of truth for the same decision. [#761](https://github.com/openai/codex-plugin-cc/pull/761)
+(`max`/`ultra` reasoning efforts) — the same proposal was closed upstream as [#648](https://github.com/openai/codex-plugin-cc/pull/648).
 
 ## FAQ
 
