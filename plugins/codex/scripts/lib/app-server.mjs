@@ -278,9 +278,10 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.proc.stdin.end();
       setTimeout(() => {
         if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
-          // On Windows with shell: true, the direct child is cmd.exe.
-          // Use terminateProcessTree to kill the entire tree including
-          // the grandchild node process.
+          // On Windows the direct child is cmd.exe — `codex` is a .cmd shim, so
+          // commandWithWindowsShim() spawns `cmd.exe /d /s /c call codex …`.
+          // Killing that child alone would leave the app-server grandchild
+          // running, so tear down the whole tree.
           if (process.platform === "win32") {
             try {
               terminateProcessTree(this.proc.pid);
@@ -310,9 +311,9 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     if (this.proc && !this.proc.killed) {
       try {
         if (process.platform === "win32") {
-          // With shell: true the direct child is cmd.exe; kill the whole
-          // tree so the codex app-server grandchild does not survive the
-          // timeout (mirrors the graceful close() path).
+          // Same as close(): on Windows the direct child is the cmd.exe that
+          // runs the `codex` shim, so the whole tree has to go or the
+          // app-server grandchild survives the timeout.
           terminateProcessTree(this.proc.pid);
         } else {
           this.proc.kill("SIGKILL");
