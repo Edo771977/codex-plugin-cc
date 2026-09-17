@@ -362,6 +362,9 @@ rl.on("line", (line) => {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
         const thread = ensureThread(state, message.params.threadId);
+        if (message.params.cwd) {
+          thread.cwd = message.params.cwd;
+        }
         thread.updatedAt = now();
         const resumedPolicy = BEHAVIOR === "external-sandbox" ? { type: "externalSandbox", networkAccess: "restricted" } : sandboxPolicy(thread.sandbox);
         state.lastThreadResume = {

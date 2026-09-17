@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--sandbox <read-only|workspace-write|danger-full-access>] [what Codex should investigate, solve, or continue]"
+argument-hint: "[--background|--wait] [--resume|--resume-thread <id>|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--sandbox <read-only|workspace-write|danger-full-access>] [what Codex should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -21,6 +21,7 @@ Execution mode:
 - `--sandbox` is a runtime-selection flag when it comes before the task text. Forward the request in the user's order and never add a `--sandbox` yourself; a `--sandbox` inside the task text is part of the prompt and stays there.
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.
 - If the request includes `--fresh`, do not ask whether to continue. The user already chose.
+- If the request includes `--resume-thread <id>`, do not ask whether to continue. The user already chose the exact Codex thread.
 - Otherwise, before starting Codex, check for a resumable rescue thread from this Claude session by running:
 
 ```bash
@@ -45,6 +46,6 @@ Operating rules:
 - Do not ask the subagent to inspect files, monitor progress, poll `/codex:status`, fetch `/codex:result`, call `/codex:cancel`, summarize output, or do follow-up work of its own.
 - Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
 - Leave the model unset unless the user explicitly asks for one. If they ask for `spark`, map it to `gpt-5.3-codex-spark`.
-- Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
+- Leave `--resume`, `--resume-thread <id>`, and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
 - If the helper reports that Codex is missing or unauthenticated, stop and tell the user to run `/codex:setup`.
 - If the user did not supply a request, ask what Codex should investigate or fix.
