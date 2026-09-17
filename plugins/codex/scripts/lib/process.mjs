@@ -421,6 +421,52 @@ export function processHasLaunchToken(pid, token, options = {}) {
 }
 
 /**
+ * Force-kill a process and everything under it, for callers that have already tried a graceful stop.
+ *
+ * POSIX has a harder signal to escalate to, and the process group addresses the descendants:
+ * SIGKILL the group, falling back to the process alone for a caller that never was a group leader.
+ *
+ * Windows has neither. There are no process groups — a negative pid is just an invalid handle, so
+ * `process.kill(-pid)` throws ESRCH and a naive catch-and-retry silently degrades to killing the
+ * direct process while its descendants (the app-server, and every MCP server under it) keep
+ * running. taskkill's own tree walk is the only way to reach them, and `/F` is already the hardest
+ * stop there is, so the Windows branch is the same call as the graceful one.
+ */
+/**
+ * @param {number} pid
+ * @param {{ platform?: string, killImpl?: Function, runCommandImpl?: Function }} [options]
+ * @returns {{ attempted: boolean, delivered: boolean, method: string | null }}
+ */
+export function forceKillProcessTree(pid, options = {}) {
+  if (!isValidPid(pid)) {
+    return { attempted: false, delivered: false, method: null };
+  }
+
+  if ((options.platform ?? process.platform) === "win32") {
+    try {
+      const outcome = terminateProcessTree(pid, options);
+      return { attempted: outcome.attempted, delivered: outcome.delivered, method: outcome.method };
+    } catch {
+      // Teardown is best effort: a taskkill that fails outright must not throw at the caller.
+      return { attempted: true, delivered: false, method: "taskkill" };
+    }
+  }
+
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+  try {
+    killImpl(-pid, "SIGKILL");
+    return { attempted: true, delivered: true, method: "process-group" };
+  } catch {
+    try {
+      killImpl(pid, "SIGKILL");
+      return { attempted: true, delivered: true, method: "process" };
+    } catch {
+      return { attempted: true, delivered: false, method: "process" };
+    }
+  }
+}
+
+/**
  * Terminate a process tree and make sure it is actually gone.
  *
  * `terminateProcessTree` sends SIGTERM and stops there, so a descendant that traps or ignores it
@@ -450,11 +496,9 @@ export function terminateProcessTreeAndExit(pid, { graceMs = 5000, exitCode = 1,
     } catch {
       // Never let bookkeeping stop the kill.
     }
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch {
-      // Nothing left in the group, or the caller was never its leader.
-    }
+    // Nothing left in the group, a caller that was never its leader, or a Windows tree that
+    // taskkill could not reach: none of them may stop us from exiting.
+    forceKillProcessTree(pid);
     process.exit(exitCode);
   }, graceMs);
 }
