@@ -232,11 +232,9 @@ async function cleanupSessionJobs(cwd, sessionId, { interruptTurns = false, inte
   }
 
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const stateFile = resolveStateFile(workspaceRoot);
-  if (!fs.existsSync(stateFile)) {
-    return;
-  }
-
+  // loadState() is candidate-aware and already returns an empty job list when
+  // nothing exists in any root; a raw existsSync() against the primary candidate
+  // alone would miss a session whose jobs only live in the fallback root.
   const sessionJobs = loadState(workspaceRoot).jobs.filter((job) => job.sessionId === sessionId);
   if (sessionJobs.length === 0) {
     return;

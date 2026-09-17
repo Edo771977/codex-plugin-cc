@@ -27,7 +27,7 @@ import {
   terminateProcessTree,
   waitForProcessExit
 } from "./process.mjs";
-import { resolveStateDir } from "./state.mjs";
+import { resolveStateDir, resolveStateDirCandidates } from "./state.mjs";
 
 const BROKER_STATE_FILE = "broker.json";
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -234,12 +234,40 @@ function resolveBrokerStateFile(cwd) {
   return path.join(resolveStateDir(cwd), BROKER_STATE_FILE);
 }
 
-export function loadBrokerSession(cwd) {
-  try {
-    return JSON.parse(fs.readFileSync(resolveBrokerStateFile(cwd), "utf8"));
-  } catch {
-    return null;
+// The state root is derived from ambient environment (CLAUDE_PLUGIN_DATA),
+// which can differ between the invocation that registered a broker and a
+// later one that looks it up -- checking every candidate root, not just the
+// current invocation's primary, is what keeps a broker registered under one
+// root from being orphaned by a lookup that resolves to the other.
+function resolveBrokerStateFileCandidates(cwd) {
+  return resolveStateDirCandidates(cwd).map((stateDir) => path.join(stateDir, BROKER_STATE_FILE));
+}
+
+// The single source of truth for which candidate is "the" active broker
+// session: the first one that both exists *and* parses. loadBrokerSession()
+// and clearBrokerSession() both build on this so they always agree -- if
+// clearBrokerSession() instead selected by existence alone, a malformed
+// primary file next to a valid fallback one would make it delete the
+// (malformed, unused) primary while loadBrokerSession() actually returned
+// and a caller tore down the fallback broker, leaving that broker's now-
+// stale record behind.
+function selectBrokerState(cwd) {
+  for (const stateFile of resolveBrokerStateFileCandidates(cwd)) {
+    if (!fs.existsSync(stateFile)) {
+      continue;
+    }
+    try {
+      const session = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+      return { stateFile, session };
+    } catch {
+      continue;
+    }
   }
+  return null;
+}
+
+export function loadBrokerSession(cwd) {
+  return selectBrokerState(cwd)?.session ?? null;
 }
 
 export function saveBrokerSession(cwd, session) {
@@ -248,8 +276,23 @@ export function saveBrokerSession(cwd, session) {
   writeJsonFileAtomic(resolveBrokerStateFile(cwd), session);
 }
 
+// Removes only the record loadBrokerSession() would return, not every
+// candidate. Both call sites act on whatever loadBrokerSession() returned --
+// tearing that broker down and clearing its record -- so clearing every
+// candidate here would delete an *other* root's broker.json for a broker
+// that was never torn down (a real reachable case: this is precisely the
+// root-split bug's own historical fallout, where the old lookup spawned a
+// duplicate broker under the other root). Erasing that record makes the
+// still-running duplicate permanently untrackable, which is worse than
+// leaving a stale-but-discoverable file behind. Built on the same
+// selectBrokerState() loadBrokerSession() uses, rather than its own
+// existence-only scan, so the two never disagree about which candidate is
+// "the" selected one when a malformed file sits in front of a valid one.
 export function clearBrokerSession(cwd) {
-  removeFileIfExists(resolveBrokerStateFile(cwd));
+  const selected = selectBrokerState(cwd);
+  if (selected) {
+    fs.unlinkSync(selected.stateFile);
+  }
 }
 
 function resolveBrokerPid(session) {
