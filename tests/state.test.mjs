@@ -9,6 +9,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir } from "./helpers.mjs";
 import { readStoredJob } from "../plugins/codex/scripts/lib/job-control.mjs";
+import { renameReplacing } from "../plugins/codex/scripts/lib/fs.mjs";
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 import { acquireLockSync, releaseLock } from "../plugins/codex/scripts/lib/locking.mjs";
 import {
   getConfig,
@@ -719,4 +722,126 @@ test("disabling the review gate is not outvoted by a stranded enable in another 
     fs.rmSync(path.join(codexHome, "plugin-cc"), { recursive: true, force: true });
     assert.equal(getConfig(workspace).stopReviewGate, false);
   });
+});
+
+test("an atomic write retries a Windows sharing violation instead of losing the record", () => {
+  const attempts = [];
+  const waits = [];
+  renameReplacing("state.json.tmp", "state.json", {
+    platform: "win32",
+    renameImpl(from, to) {
+      attempts.push({ from, to });
+      if (attempts.length <= 2) {
+        // What a scanner or indexer holding the target open looks like from here.
+        const error = new Error("EPERM: operation not permitted, rename");
+        error.code = "EPERM";
+        throw error;
+      }
+    },
+    sleepImpl(ms) {
+      waits.push(ms);
+    }
+  });
+
+  assert.equal(attempts.length, 3);
+  assert.deepEqual(attempts.at(-1), { from: "state.json.tmp", to: "state.json" });
+  assert.deepEqual(waits, [5, 15]);
+});
+
+test("an atomic write gives up on a Windows sharing violation that never clears", () => {
+  let attempts = 0;
+  assert.throws(
+    () =>
+      renameReplacing("state.json.tmp", "state.json", {
+        platform: "win32",
+        renameImpl() {
+          attempts += 1;
+          const error = new Error("EBUSY: resource busy or locked, rename");
+          error.code = "EBUSY";
+          throw error;
+        },
+        sleepImpl() {}
+      }),
+    /EBUSY/
+  );
+
+  // Four waits, five attempts: the budget is bounded, and the last failure is the caller's.
+  assert.equal(attempts, 5);
+});
+
+test("an atomic write does not retry errors that are not sharing violations", () => {
+  for (const platform of ["win32", "linux"]) {
+    let attempts = 0;
+    assert.throws(
+      () =>
+        renameReplacing("state.json.tmp", "state.json", {
+          platform,
+          renameImpl() {
+            attempts += 1;
+            const error = new Error("ENOENT: no such file or directory, rename");
+            error.code = "ENOENT";
+            throw error;
+          },
+          sleepImpl() {
+            throw new Error("must not wait");
+          }
+        }),
+      /ENOENT/
+    );
+    assert.equal(attempts, 1, `${platform} must fail on the first attempt`);
+  }
+});
+
+test("outside Windows an atomic write renames once and reports the failure", () => {
+  let attempts = 0;
+  assert.throws(
+    () =>
+      renameReplacing("state.json.tmp", "state.json", {
+        platform: "linux",
+        renameImpl() {
+          attempts += 1;
+          const error = new Error("EPERM: operation not permitted, rename");
+          error.code = "EPERM";
+          throw error;
+        },
+        sleepImpl() {
+          throw new Error("POSIX rename has no sharing violation to wait out");
+        }
+      }),
+    /EPERM/
+  );
+  assert.equal(attempts, 1);
+});
+
+test("plugin scripts replace files through the Windows-aware rename", () => {
+  // A bare fs.renameSync() over an existing file is the call that Windows can refuse with a
+  // sharing violation, so file replacement goes through renameReplacing(), which retries it.
+  // locking.mjs is the exception: its directory rename already reads EPERM as "someone else
+  // holds the lock", which is exactly what it means there.
+  const scriptsDir = path.join(REPO_ROOT, "plugins", "codex", "scripts");
+  const callers = new Set();
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!entry.name.endsWith(".mjs")) {
+        continue;
+      }
+      for (const line of fs.readFileSync(full, "utf8").split("\n")) {
+        const code = line.trim();
+        if (code.startsWith("//") || code.startsWith("*") || code.startsWith("/*")) {
+          continue;
+        }
+        if (/\bfs\.renameSync\s*\(/.test(code)) {
+          callers.add(path.relative(REPO_ROOT, full).split(path.sep).join("/"));
+        }
+      }
+    }
+  };
+  walk(scriptsDir);
+
+  assert.deepEqual([...callers].sort(), ["plugins/codex/scripts/lib/locking.mjs"]);
 });

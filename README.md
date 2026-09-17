@@ -467,6 +467,11 @@ Beyond the imports, this fork carries fixes for defects the imports themselves s
 - `/codex:cancel` exits non-zero when neither the turn interrupt nor the worker kill confirmed the
   job stopped, instead of reporting a cancellation nothing proved
   ([#656](https://github.com/openai/codex-plugin-cc/pull/656))
+- teardown on Windows no longer signals a negative pid (a process group is POSIX-only; there it is
+  just an invalid handle, and the fallback killed the worker while its app-server subtree kept
+  running) — `taskkill /T /F` walks the tree instead
+- a state write that Windows briefly refuses — a scanner or indexer holding the file open, which
+  surfaces as `EPERM`/`EBUSY` on the replacing rename — is retried instead of losing the record
 - the app-server typecheck (`npm run build`) passes
 
 Each of those came out of an adversarial review of the merges, re-run after every round of fixes;

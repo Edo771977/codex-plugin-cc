@@ -37,6 +37,43 @@ export function writePrivateFile(filePath, value) {
   setMode(filePath, PRIVATE_FILE_MODE);
 }
 
+// Windows can refuse to replace a file that something else has open — an on-access virus scanner
+// or a search indexer opening the target for a moment is enough, and it surfaces as EPERM/EACCES/
+// EBUSY rather than as anything the caller could act on. POSIX rename has no such failure mode, so
+// this retry is Windows-only: a handful of short waits, after which the error is real and is thrown.
+const WINDOWS_RENAME_RETRY_DELAYS_MS = [5, 15, 40, 100];
+const WINDOWS_RENAME_RETRY_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * @param {string} from
+ * @param {string} to
+ * @param {{ platform?: string, renameImpl?: Function, sleepImpl?: Function }} [options]
+ */
+export function renameReplacing(from, to, options = {}) {
+  const renameImpl = options.renameImpl ?? fs.renameSync;
+  if ((options.platform ?? process.platform) !== "win32") {
+    renameImpl(from, to);
+    return;
+  }
+
+  const sleepImpl = options.sleepImpl ?? sleepSync;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      renameImpl(from, to);
+      return;
+    } catch (error) {
+      if (attempt >= WINDOWS_RENAME_RETRY_DELAYS_MS.length || !WINDOWS_RENAME_RETRY_CODES.has(error?.code)) {
+        throw error;
+      }
+      sleepImpl(WINDOWS_RENAME_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+
 export function writeJsonFileAtomic(filePath, value) {
   const temporaryFile = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   try {
@@ -52,7 +89,7 @@ export function writeJsonFileAtomic(filePath, value) {
     } finally {
       fs.closeSync(fd);
     }
-    fs.renameSync(temporaryFile, filePath);
+    renameReplacing(temporaryFile, filePath);
     setMode(filePath, PRIVATE_FILE_MODE);
   } catch (error) {
     fs.rmSync(temporaryFile, { force: true });
