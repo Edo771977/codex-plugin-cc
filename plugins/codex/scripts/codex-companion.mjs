@@ -87,7 +87,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--sandbox <read-only|workspace-write|danger-full-access>] [--resume-last|--resume|--resume-thread <id>|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--sandbox <read-only|workspace-write|danger-full-access>] [--read-root <directory> ...] [--resume-last|--resume|--resume-thread <id>|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -194,6 +194,22 @@ function resolveCommandCwd(options = {}) {
 
 function resolveCommandWorkspace(options = {}) {
   return resolveWorkspaceRoot(resolveCommandCwd(options));
+}
+
+function resolveReadRoot(cwd, readRoot) {
+  if (typeof readRoot !== "string" || !readRoot.trim()) {
+    throw new Error("--read-root must name an existing directory: value is empty");
+  }
+  const resolved = path.resolve(cwd, readRoot);
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+    throw new Error(`--read-root must name an existing directory: ${readRoot}`);
+  }
+  return fs.realpathSync(resolved);
+}
+
+function pathCovers(parent, child) {
+  const relative = path.relative(parent, child);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== "..");
 }
 
 function sleep(ms) {
@@ -532,6 +548,8 @@ async function executeTaskRun(request) {
     model: request.model,
     effort: request.effort,
     sandbox: request.sandbox ?? defaultTaskSandbox(Boolean(request.write)),
+    readRoots: request.readRoots,
+    write: request.write,
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
@@ -644,7 +662,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, sandbox, resumeLast, resumeThread = null, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, sandbox, readRoots, resumeLast, resumeThread = null, jobId }) {
   return {
     cwd,
     model,
@@ -652,6 +670,7 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, sandbox, resumeLa
     prompt,
     write,
     sandbox,
+    readRoots,
     resumeLast,
     resumeThread,
     jobId
@@ -848,6 +867,7 @@ async function handleReview(argv) {
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file", "sandbox", "resume-thread"],
+    multiValueOptions: ["read-root"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     leadingOnlyOptions: ["sandbox"],
     aliasMap: {
@@ -873,6 +893,17 @@ async function handleTask(argv) {
   }
   const sandbox = normalizeSandboxMode(options.sandbox) ?? defaultTaskSandbox(Boolean(options.write));
   const write = sandbox !== "read-only";
+  const readRoots = (options["read-root"] ?? []).map((readRoot) => resolveReadRoot(cwd, readRoot));
+  if (readRoots.length > 0 && sandbox === "danger-full-access") {
+    throw new Error(
+      "--read-root cannot be combined with --sandbox danger-full-access: that mode disables the Codex sandbox, so no read scope is enforced."
+    );
+  }
+  if (write && readRoots.length > 0 && !readRoots.some((readRoot) => pathCovers(readRoot, workspaceRoot))) {
+    throw new Error(
+      "--write requires an approved --read-root that covers the workspace directory; the same applies to --sandbox workspace-write."
+    );
+  }
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast: resumeLast || Boolean(resumeThread)
@@ -890,6 +921,7 @@ async function handleTask(argv) {
       prompt,
       write,
       sandbox,
+      readRoots,
       resumeLast,
       resumeThread,
       jobId: job.id
@@ -910,6 +942,7 @@ async function handleTask(argv) {
         prompt,
         write,
         sandbox,
+        readRoots,
         resumeLast,
         resumeThread,
         jobId: job.id,

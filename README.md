@@ -150,6 +150,7 @@ Examples:
 /codex:rescue --background investigate the regression
 /codex:rescue --sandbox read-only explain how the cache invalidation works
 /codex:rescue --sandbox danger-full-access run the integration tests and fix what fails
+/codex:rescue --read-root ./src --read-root ./tests inspect only the approved paths
 ```
 
 You can also just ask for a task to be delegated to Codex:
@@ -165,6 +166,10 @@ Ask Codex to redesign the database connection to be more resilient.
 - follow-up rescue requests can continue the latest Codex task in the repo
 - `--sandbox` applies to `/codex:rescue` only; the review commands stay read-only. It takes precedence over `--write` and counts only before the task text. Rescue runs edit files inside the repository by default (`workspace-write`); `read-only` blocks edits, and `danger-full-access` disables the Codex sandbox entirely, so Codex can write outside the repository and use the network without asking. Reserve it for tasks the sandbox blocks.
 - a resumed thread keeps the sandbox it was started with while the plugin's shared app-server still holds it, which is the normal case inside one Claude Code session (Codex CLI 0.153.2 applies a new mode only when it loads the thread again from disk). `task` refuses a resume whose sandbox differs from what the app-server reports; resume with the same `--sandbox`, or start a new thread with `--fresh`.
+- each `--read-root <directory>` must name an existing directory and opts into an OS-enforced permission profile that denies local command reads outside the listed directories and Codex's minimal runtime paths
+- a scoped `--write` (or `--sandbox workspace-write`) requires the approved read roots to cover the workspace directory and uses Codex's built-in `:workspace` write policy; `--read-root` is rejected together with `--sandbox danger-full-access`
+- scoped reads require Codex 0.138.0 or later and fail closed when the runtime cannot enforce permission profiles
+- filesystem profiles apply to local sandboxed commands, not web search, MCP servers, connectors, browser tools, or computer use
 
 ### `/codex:transfer`
 

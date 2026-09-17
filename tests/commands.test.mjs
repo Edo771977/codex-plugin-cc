@@ -106,6 +106,8 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /--model <model\|spark>/);
   assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh>/);
   assert.match(rescue, /--sandbox <read-only\|workspace-write\|danger-full-access>/);
+  assert.match(rescue, /--read-root <directory>/);
+  assert.match(rescue, /Preserve every `--read-root <directory>`/i);
   assert.match(rescue, /task-resume-candidate --json/);
   assert.match(rescue, /AskUserQuestion/);
   assert.match(rescue, /Continue current Codex thread/);
@@ -132,6 +134,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /--resume/);
   assert.match(agent, /--fresh/);
   assert.match(agent, /--resume-thread <id>/);
+  assert.match(agent, /Preserve every `--read-root <directory>`/i);
   assert.match(agent, /thin forwarding wrapper/i);
   assert.match(agent, /Treat `--resume`, `--resume-thread <id>`, and `--fresh` as routing controls/i);
   assert.match(agent, /`--resume-thread <id>` means pass that exact routing pair through and do not add `--resume-last`/i);
@@ -167,11 +170,16 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /`--sandbox`: accepted values are `read-only`, `workspace-write`, `danger-full-access`/i);
   assert.match(runtimeSkill, /It takes precedence over `--write`/i);
   assert.match(runtimeSkill, /Never add a `--sandbox` the user did not type/i);
+  assert.match(runtimeSkill, /Preserve every `--read-root <directory>`/i);
+  assert.match(runtimeSkill, /existing directory/i);
+  assert.match(runtimeSkill, /a write-capable sandbox requires an approved read root to cover the workspace directory/i);
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
   assert.match(readme, /`codex:codex-rescue` subagent/i);
   assert.match(readme, /if you do not pass `--model` or `--effort`, Codex chooses its own defaults/i);
   assert.match(readme, /--model gpt-5\.4-mini --effort medium/i);
+  assert.match(readme, /--read-root/);
+  assert.match(readme, /`--write`.*cover the workspace directory/i);
   assert.match(readme, /`spark`, the plugin maps that to `gpt-5\.3-codex-spark`/i);
   assert.match(readme, /continue a previous Codex task/i);
   assert.match(readme, /--sandbox <read-only\|workspace-write\|danger-full-access>/);

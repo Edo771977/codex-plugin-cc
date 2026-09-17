@@ -320,13 +320,16 @@ rl.on("line", (line) => {
         if (BEHAVIOR === "auth-run-fails") {
           throw new Error("authentication expired; run codex login");
         }
+        if (BEHAVIOR === "permission-profiles-unsupported" && message.params.config) {
+          throw new Error("unknown field config.default_permissions");
+        }
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral, message.params.sandbox);
         state.lastThreadStart = {
+          ...message.params,
           threadId: thread.id,
-          sandbox: message.params.sandbox ?? null,
           approvalPolicy: message.params.approvalPolicy ?? null
         };
         saveState(state);
@@ -358,6 +361,9 @@ rl.on("line", (line) => {
       }
 
       case "thread/resume": {
+        if (BEHAVIOR === "permission-profiles-unsupported" && message.params.config) {
+          throw new Error("unknown field config.default_permissions");
+        }
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
@@ -368,8 +374,8 @@ rl.on("line", (line) => {
         thread.updatedAt = now();
         const resumedPolicy = BEHAVIOR === "external-sandbox" ? { type: "externalSandbox", networkAccess: "restricted" } : sandboxPolicy(thread.sandbox);
         state.lastThreadResume = {
-          threadId: thread.id,
-          sandbox: message.params.sandbox ?? null
+          ...message.params,
+          threadId: thread.id
         };
         saveState(state);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: resumedPolicy, reasoningEffort: null } });

@@ -29,6 +29,8 @@ Command selection:
 - If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request carries `--sandbox` before the task text (alongside `--model`, `--effort`, `--resume` or `--fresh`), pass it through in that position and do not add `--write`. A `--sandbox` inside the task text is prompt text; leave it in place.
+- Preserve every `--read-root <directory>` pair, pass it through to `task`, and exclude both tokens from the natural-language task text. Each value must name an existing directory; files and missing paths fail before Codex starts.
+- With scoped access, a write-capable sandbox requires an approved read root to cover the workspace directory and uses Codex's built-in `:workspace` write policy. `--read-root` cannot be combined with `--sandbox danger-full-access`, which disables the sandbox entirely.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
 - If the forwarded request includes `--resume-thread <id>`, strip both tokens from the task text and pass `--resume-thread <id>` to `task`; this resumes that exact Codex thread instead of the latest one.

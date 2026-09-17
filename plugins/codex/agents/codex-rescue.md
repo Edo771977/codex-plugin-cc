@@ -32,6 +32,8 @@ Forwarding rules:
 - If the user asks for a concrete model name such as `gpt-5.4-mini`, pass it through with `--model`.
 - Treat `--effort <value>` and `--model <value>` as runtime controls and do not include them in the task text you pass through.
 - If the user passes `--sandbox <read-only|workspace-write|danger-full-access>` before the task text, forward it in that position and do not add `--write`; the sandbox already decides whether Codex may edit. A `--sandbox` inside the task text is part of the prompt: leave it there. Never add a `--sandbox` on your own.
+- Preserve every `--read-root <directory>` pair as a runtime control and do not include either token in the task text you pass through.
+- When forwarding both scoped roots and a write-capable sandbox (`--write` or `--sandbox workspace-write`), include an approved read root that covers the workspace directory.
 - Otherwise default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
 - Treat `--resume`, `--resume-thread <id>`, and `--fresh` as routing controls and do not include them in the task text you pass through.
 - `--resume` means add `--resume-last`.
