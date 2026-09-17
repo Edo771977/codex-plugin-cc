@@ -265,21 +265,6 @@ async function cleanupSessionJobs(cwd, sessionId, { interruptTurns = false, inte
     if (!stillRunning) {
       continue;
     }
-    // A dead worker still gets its terminal record below — that is what keeps
-    // /codex:status from answering "No job found" for the session that just
-    // ended. Reconciliation is consulted only for the one case where writing
-    // that record would be a lie: see the retain below.
-    const reconciled = reconcileJobLiveness(job);
-    if (reconciled.workerExited && reconciled.threadId && !reconciled.turnId) {
-      // The worker died after turn/start was accepted but before it recorded a
-      // turn id, so the Codex turn may still be running and there is nothing to
-      // interrupt it by. Cancelling the record here would claim an outcome that
-      // did not happen; leave it active (its phase says why) for the next
-      // status query, which reconciles it the same way.
-      upsertJob(workspaceRoot, { id: job.id, phase: reconciled.phase, pid: null });
-      continue;
-    }
-    jobsAwaitingInterrupt -= 1;
     // The state snapshot can carry the queued record's pid: null while the
     // worker has since written its real pid (and turn identity) to the job
     // file — and the terminal patches below null the pid field, destroying
@@ -296,6 +281,26 @@ async function cleanupSessionJobs(cwd, sessionId, { interruptTurns = false, inte
     } catch {
       // Keep the snapshot values.
     }
+    // A dead worker still gets its terminal record below — that is what keeps
+    // /codex:status from answering "No job found" for the session that just
+    // ended. Reconciliation is consulted only for the one case where writing
+    // that record would be a lie, and it reads the values captured above
+    // rather than the snapshot: the snapshot's pid can be null while the
+    // worker has long since published its real pid and turn identity, which
+    // would both skip this check and misjudge the turn as unidentified.
+    const reconciled = reconcileJobLiveness({ ...job, pid: workerPid, threadId, turnId });
+    if (reconciled.workerExited && threadId && !turnId) {
+      // The worker died after turn/start was accepted but before it recorded a
+      // turn id, so the Codex turn may still be running and there is nothing to
+      // interrupt it by. Cancelling the record here would claim an outcome that
+      // did not happen; leave it active (its phase says why) for the next
+      // status query. The pid is written back rather than nulled: it is what
+      // lets that query reconcile the job again instead of trusting a stale
+      // "running".
+      upsertJob(workspaceRoot, { id: job.id, phase: reconciled.phase, pid: workerPid, threadId });
+      continue;
+    }
+    jobsAwaitingInterrupt -= 1;
     // The worker may be recording its own terminal outcome right now; only
     // cancel jobs whose terminal status this hook wins — unless the claim is
     // orphaned (its owner died before writing a terminal record), in which

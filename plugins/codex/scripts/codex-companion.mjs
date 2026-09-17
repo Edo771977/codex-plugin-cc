@@ -1194,6 +1194,21 @@ async function handleCancel(argv) {
   // writes below null the pid field, so capture the fresher value first.
   let workerPid = existing.pid ?? job.pid ?? Number.NaN;
 
+  // A worker that exited after turn/start was accepted, but before it recorded
+  // a turn id, leaves a Codex turn that may still be running and nothing to
+  // address it by, so the cancel refuses. It refuses here, before the terminal
+  // claim below: the claim is never released, and a leaked cancel-intent claim
+  // makes the next cancel (or SessionEnd) reassert it into a cancelled record
+  // for the turn that is still running — the very outcome this refusal exists
+  // to prevent. No identity wait can help either: the worker that would
+  // publish the turn id is already gone.
+  const reconciledForCancel = reconcileJobLiveness({ ...job, ...existing });
+  if (reconciledForCancel.workerExited && threadId && !turnId) {
+    throw new Error(
+      `Cannot safely cancel ${job.id}: the worker exited after turn/start was accepted, but the turn id is not yet known. The Codex turn may still be running.`
+    );
+  }
+
   // Claim the terminal status first: if the worker finished in the meantime,
   // its completed/failed record stands and there is nothing left to cancel.
   // That race is benign, so report the job's terminal outcome as a normal
@@ -1249,19 +1264,6 @@ async function handleCancel(argv) {
     workerPid = finished?.pid ?? workerPid;
     reassertTerminalClaim(workspaceRoot, job.id, finished);
     orphanAdopted = true;
-  }
-
-  // A worker that exited after turn/start was accepted, but before it recorded
-  // a turn id, leaves a Codex turn that may still be running and nothing to
-  // address it by. This has to refuse before the record-first write below:
-  // reporting the job cancelled while its turn runs on is the failure mode.
-  // No identity wait can help here either — the worker that would publish the
-  // turn id is already gone.
-  const reconciledForCancel = reconcileJobLiveness(readStoredJob(workspaceRoot, job.id) ?? job);
-  if (reconciledForCancel.workerExited && (threadId ?? reconciledForCancel.threadId) && !(turnId ?? reconciledForCancel.turnId)) {
-    throw new Error(
-      `Cannot safely cancel ${job.id}: the worker exited after turn/start was accepted, but the turn id is not yet known. The Codex turn may still be running.`
-    );
   }
 
   // Persist the terminal record before touching the turn or the worker: a

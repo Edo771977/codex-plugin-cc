@@ -1335,7 +1335,15 @@ export async function runAppServerTurn(cwd, options = {}) {
           write: options.write,
           ephemeral: false
         });
-        assertResumedSandbox(options.resumeThreadId, options.sandbox, response);
+        // Only meaningful when the resume actually asked for a sandbox mode.
+        // With read roots, buildThreadAccessParams() deliberately sends a
+        // scoped permission profile and no `sandbox`, so the app-server's
+        // reported mode is not the one this turn requested: asserting it here
+        // refused every `--read-root` resume, and the error's own advice
+        // (resume with the reported mode) silently dropped the write grant.
+        if (!(options.readRoots?.length > 0)) {
+          assertResumedSandbox(options.resumeThreadId, options.sandbox, response);
+        }
         threadId = response.thread.id;
       } else {
         emitProgress(options.onProgress, "Starting Codex task thread.", "starting");

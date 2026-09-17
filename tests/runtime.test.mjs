@@ -5602,3 +5602,95 @@ test("stop hook keeps an orphaned live turn active when its wrapper died", () =>
   assert.equal(result.stdout.trim(), "");
   assert.match(result.stderr, /task-orphan-turn is still running/i);
 });
+
+
+test("a refused cancel leaves no terminal claim behind", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify({
+    version: 1, config: { stopReviewGate: false }, jobs: [{
+      id: "task-turn-pending", status: "running", title: "Codex Task", jobClass: "task",
+      sessionId: "sess-current", pid: 999999, threadId: "thr_pending",
+      updatedAt: "2099-01-01T00:00:00.000Z"
+    }]
+  }, null, 2)}\n`, "utf8");
+  const env = { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-current" };
+
+  const refused = run("node", [SCRIPT, "cancel", "task-turn-pending", "--json"], { cwd: workspace, env });
+  assert.equal(refused.status, 1);
+
+  // The terminal claim is never released, so a claim taken before the refusal
+  // would be adopted by the next cancel (or by SessionEnd) and reasserted into
+  // a cancelled record — for the turn this refusal exists to protect.
+  assert.equal(fs.existsSync(path.join(jobsDir, "task-turn-pending.terminal")), false);
+
+  const again = run("node", [SCRIPT, "cancel", "task-turn-pending", "--json"], { cwd: workspace, env });
+  assert.equal(again.status, 1);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "running");
+});
+
+test("task --resume-last still works with scoped read roots", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+
+  const first = run("node", [SCRIPT, "task", "--write", "--read-root", repo, "initial task"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+
+  // A scoped run sends a permission profile and no sandbox mode, so the mode
+  // the app-server reports on resume is not the one this turn asked for.
+  // Asserting it refused every --read-root resume outright.
+  const resumed = run("node", [SCRIPT, "task", "--resume-last", "--write", "--read-root", repo, "follow up"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastThreadResume.sandbox, undefined);
+  assert.equal(fakeState.lastThreadResume.config.default_permissions, "claude_companion_scoped");
+});
+
+
+test("a retained orphaned turn stays reconcilable after session end", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  // The index carries the queued record's pid: null, while the job file has the
+  // real (now dead) pid and the thread the worker started. Session end must read
+  // the file, not the snapshot: on the snapshot alone there is no pid to judge,
+  // so the job would be recorded cancelled while its turn may still run.
+  fs.writeFileSync(path.join(jobsDir, "task-retained.json"), `${JSON.stringify({
+    id: "task-retained", status: "running", title: "Codex Task", jobClass: "task",
+    sessionId: "sess-current", pid: 999999, threadId: "thr_pending"
+  }, null, 2)}\n`, "utf8");
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify({
+    version: 1, config: { stopReviewGate: false }, jobs: [{
+      id: "task-retained", status: "running", title: "Codex Task", jobClass: "task",
+      sessionId: "sess-current", pid: null, threadId: null,
+      updatedAt: "2099-01-01T00:00:00.000Z"
+    }]
+  }, null, 2)}\n`, "utf8");
+
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: workspace,
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-current" },
+    input: JSON.stringify({ hook_event_name: "SessionEnd", session_id: "sess-current", cwd: workspace })
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  const retained = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs[0];
+  assert.equal(retained.status, "running");
+  // Written back rather than nulled: reconcileJobLiveness() needs a pid, so a
+  // record retained without one can never be judged again and stays "running"
+  // forever in /codex:status.
+  assert.equal(retained.pid, 999999);
+  assert.equal(retained.threadId, "thr_pending");
+  assert.equal(retained.phase, "worker-exited-turn-unknown");
+});
