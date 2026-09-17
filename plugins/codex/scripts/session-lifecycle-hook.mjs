@@ -5,6 +5,7 @@ import process from "node:process";
 
 import { isPidAlive, terminateProcessTree } from "./lib/process.mjs";
 import { reconcileJobLiveness } from "./lib/job-control.mjs";
+import { brokerIdleShutdownMs } from "./lib/lifecycle-limits.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
   LOG_FILE_ENV,
@@ -109,10 +110,11 @@ function setEnv(name, value) {
     return;
   }
 
-  // A hook that appended without a trailing newline would otherwise have its
-  // line and ours run together, losing both exports.
-  const separator = content === "" || content.endsWith("\n") ? "" : "\n";
-  fs.appendFileSync(envFile, `${separator}${line}\n`, "utf8");
+  // Always open with a newline rather than deciding from the read above: a
+  // hook appending an unterminated line between that read and this write would
+  // otherwise run into ours, losing both exports. A blank line costs nothing to
+  // the shell that sources this file.
+  fs.appendFileSync(envFile, `\n${line}\n`, "utf8");
 }
 
 // A pid-less active record has no liveness signal at all (current code
@@ -129,6 +131,27 @@ function isStaleJobRecord(job) {
     return false;
   }
   return Date.now() - timestamp > ACTIVE_JOB_STALENESS_MS;
+}
+
+// A record retained because its worker died with a turn still possibly running
+// has no pid to probe, so the generic pid-less rule (a day) would keep it
+// "running" — and keep it pinning the broker — for a day. The turn it protects
+// cannot outlive the broker anyway: its client is gone, so the broker idles out
+// on its own timer. Bound the protection to that same window.
+function retainedOrphanExpired(job, env = process.env) {
+  if (job?.workerExited !== true) {
+    return false;
+  }
+  const reference = job.updatedAt ?? job.createdAt ?? null;
+  const timestamp = reference ? Date.parse(reference) : Number.NaN;
+  if (!Number.isFinite(timestamp)) {
+    return false;
+  }
+  const windowMs = brokerIdleShutdownMs(env);
+  if (!Number.isFinite(windowMs) || windowMs <= 0) {
+    return false;
+  }
+  return Date.now() - timestamp > windowMs;
 }
 
 // Nothing else transitions the record of a worker that died without its
@@ -164,7 +187,12 @@ async function reapDeadWorkerJobs(workspaceRoot, { excludeSessionId = null, cwd 
       continue;
     }
     jobsAwaitingInterrupt -= 1;
-    const workerDead = job.pid != null ? !isPidAlive(job.pid) : isStaleJobRecord(job);
+    const workerDead =
+      job.pid != null
+        ? !isPidAlive(job.pid)
+        : job.workerExited === true
+          ? retainedOrphanExpired(job)
+          : isStaleJobRecord(job);
     if (!workerDead) {
       continue;
     }
@@ -239,13 +267,16 @@ function hasActiveJobsFromOtherSessions(workspaceRoot, sessionId) {
     if (job.pid != null) {
       return isPidAlive(job.pid);
     }
+    if (job.workerExited === true) {
+      return !retainedOrphanExpired(job);
+    }
     return !isStaleJobRecord(job);
   });
 }
 
 async function cleanupSessionJobs(cwd, sessionId, { interruptTurns = false, interruptDeadline = null } = {}) {
   if (!cwd || !sessionId) {
-    return;
+    return { retainedOrphans: 0 };
   }
 
   const workspaceRoot = resolveWorkspaceRoot(cwd);
@@ -254,7 +285,7 @@ async function cleanupSessionJobs(cwd, sessionId, { interruptTurns = false, inte
   // alone would miss a session whose jobs only live in the fallback root.
   const sessionJobs = loadState(workspaceRoot).jobs.filter((job) => job.sessionId === sessionId);
   if (sessionJobs.length === 0) {
-    return;
+    return { retainedOrphans: 0 };
   }
 
   const completedAt = new Date().toISOString();
@@ -266,6 +297,10 @@ async function cleanupSessionJobs(cwd, sessionId, { interruptTurns = false, inte
     errorMessage: "Cancelled: the Claude session ended while the job was still running."
   };
   const cancelledIds = new Set();
+  // Jobs left active because their turn may still be running: the broker must
+  // outlive this hook run for them, and hasActiveJobsFromOtherSessions() will
+  // not speak for them — they belong to the session that is ending.
+  let retainedOrphans = 0;
   const killedPids = [];
   const finishingJobs = [];
   interruptDeadline = interruptDeadline ?? Date.now() + TURN_INTERRUPT_BUDGET_MS;
@@ -322,6 +357,7 @@ async function cleanupSessionJobs(cwd, sessionId, { interruptTurns = false, inte
         threadId,
         workerExited: true
       });
+      retainedOrphans += 1;
       continue;
     }
     jobsAwaitingInterrupt -= 1;
@@ -472,6 +508,8 @@ async function cleanupSessionJobs(cwd, sessionId, { interruptTurns = false, inte
       return isActiveJob(job);
     });
   });
+
+  return { retainedOrphans };
 }
 
 function handleSessionStart(input) {
@@ -504,7 +542,16 @@ async function handleSessionEnd(input) {
     interruptTurns,
     interruptDeadline
   });
-  await cleanupSessionJobs(cwd, sessionId, { interruptTurns, interruptDeadline });
+  const cleanup = await cleanupSessionJobs(cwd, sessionId, { interruptTurns, interruptDeadline });
+
+  // A turn this session could not interrupt — its worker died before publishing
+  // a turn id — may still be running on this broker. The guard below speaks
+  // only for other sessions' work, so without this the same hook run would
+  // tear the runtime down under the turn the retain exists to protect. The
+  // broker idles out on its own timer, which is what bounds the wait.
+  if (cleanup?.retainedOrphans > 0) {
+    return;
+  }
 
   // The broker and state dir are workspace-shared, not session-owned. If any
   // other session still has work in flight, tearing the broker down would

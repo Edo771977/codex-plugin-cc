@@ -1373,6 +1373,12 @@ export async function runAppServerTurn(cwd, options = {}) {
           ephemeral: options.persistThread ? false : true,
           threadName: options.persistThread ? options.threadName : options.threadName ?? null
         });
+        // A default config can start a thread with the sandbox disabled, in
+        // which case the scope this run asked for would not hold here either —
+        // and "start a fresh thread" is the advice the resume path gives.
+        if (options.readRoots?.length > 0) {
+          assertScopedResumeNotEscalated(response.thread.id, response);
+        }
         threadId = response.thread.id;
       }
     } catch (error) {

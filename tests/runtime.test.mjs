@@ -889,9 +889,17 @@ test("session start hook exports the Claude session id, transcript path, and plu
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(
-    fs.readFileSync(envFile, "utf8"),
-    `export CODEX_COMPANION_SESSION_ID='sess-current'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='${transcriptPath}'\nexport CLAUDE_PLUGIN_DATA='${pluginDataDir}'\n`
+  // Each export opens with its own newline, so a line another plugin's hook
+  // appended without one cannot run into ours. Blank lines are nothing to the
+  // shell that sources this file, so the contract is the exports and their
+  // order, not byte-for-byte content.
+  assert.deepEqual(
+    fs.readFileSync(envFile, "utf8").split("\n").filter((line) => line !== ""),
+    [
+      "export CODEX_COMPANION_SESSION_ID='sess-current'",
+      `export CODEX_COMPANION_TRANSCRIPT_PATH='${transcriptPath}'`,
+      `export CLAUDE_PLUGIN_DATA='${pluginDataDir}'`
+    ]
   );
 });
 

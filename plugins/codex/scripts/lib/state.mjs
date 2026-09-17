@@ -229,7 +229,7 @@ function removeJobArtifacts(stateDir, job) {
   }
 }
 
-function pruneOtherStateRoot(otherStateDir, retainedIds) {
+function pruneOtherStateRoot(otherStateDir, retainedIds, knownIds) {
   const otherStateFile = path.join(otherStateDir, STATE_FILE_NAME);
   if (!fs.existsSync(otherStateFile)) {
     return;
@@ -242,13 +242,14 @@ function pruneOtherStateRoot(otherStateDir, retainedIds) {
         // have been replaced while the lock was being taken.
         const otherParsed = readStateFileIfValid(otherStateFile);
         const otherJobs = Array.isArray(otherParsed?.jobs) ? otherParsed.jobs : [];
-        const prunedOtherJobs = otherJobs.filter((job) => retainedIds.has(job.id));
+        const dropped = (job) => !retainedIds.has(job.id) && knownIds.has(job.id);
+        const prunedOtherJobs = otherJobs.filter((job) => !dropped(job));
         if (prunedOtherJobs.length === otherJobs.length) {
           return;
         }
         writeJsonFileAtomic(otherStateFile, { ...otherParsed, jobs: prunedOtherJobs });
         for (const job of otherJobs) {
-          if (!retainedIds.has(job.id)) {
+          if (dropped(job)) {
             removeJobArtifacts(otherStateDir, job);
           }
         }
@@ -296,9 +297,13 @@ function saveStateLocked(cwd, state) {
   // only in a non-primary root. Prune every other candidate root down to the same
   // retained set; new and updated jobs are still only ever written to the primary
   // root, above. This only ever removes.
+  // Ids the caller actually decided about: whatever the merged snapshot at the
+  // top of this function held. Anything else in another root arrived after it
+  // and is nobody's to drop here.
+  const knownIds = new Set(previousJobs.map((job) => job.id));
   const [, ...otherStateDirs] = resolveStateDirCandidates(cwd);
   for (const otherStateDir of otherStateDirs) {
-    pruneOtherStateRoot(otherStateDir, retainedIds);
+    pruneOtherStateRoot(otherStateDir, retainedIds, knownIds);
   }
 
   return nextState;
