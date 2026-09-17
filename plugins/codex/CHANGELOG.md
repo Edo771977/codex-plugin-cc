@@ -13,6 +13,9 @@
 - Persist the failure text of a turn that fails without throwing, and shorten job summaries to 96 characters.
 - Keep the review-gate flag in a durable per-workspace file under `CODEX_HOME`, written privately and atomically.
 - Resolve Node through `scripts/run-node.sh` in the hooks, preferring a user-managed toolchain over a system install.
+- Release the broker's app-server thread subscriptions when a client disconnects, so a departed client no longer leaks them for the broker's lifetime (openai/codex-plugin-cc#707).
+- Read state from every candidate `CLAUDE_PLUGIN_DATA` root, so jobs and broker records written by one invocation are not invisible to another (openai/codex-plugin-cc#659).
+- Reconcile a job against its worker process, so a job whose worker died stops reading as running (openai/codex-plugin-cc#728).
 
 ## 1.0.0
 

@@ -37,6 +37,29 @@ Accepted `--effort` values are `none`, `minimal`, `low`, `medium`, `high`, and `
 unrecognised `--flag` is not silently swallowed into the prompt: the plugin warns on stderr and
 passes the token through as text.
 
+### What The Background Runtime Guarantees
+
+Delegated work outlives the Claude session that started it, so most of this fork's divergence from
+upstream is about what happens when something dies at the wrong moment. In short:
+
+- **A job's state is checked, not trusted.** Every status, result and cancel reconciles the record
+  against the worker process, so a run whose worker died does not read as running forever.
+- **Ending a session never reports an outcome that did not happen.** In-flight jobs are interrupted
+  and recorded as cancelled; a turn that cannot be interrupted keeps its runtime alive instead, on a
+  bounded window.
+- **One broker per workspace, shut down by the last session out.** It is never torn down while
+  another session has work in flight, and a departed client's Codex threads are unsubscribed rather
+  than left to leak notifications into the next one.
+- **A finished job keeps a record, with its cause.** Sessions end without erasing what ran, so
+  `/codex:status` answers with an outcome rather than "No job found".
+- **Nothing the plugin writes is world-readable, and nothing is half-written.** State, job files,
+  logs and the review-gate config are 0600 and written through a temp file and a rename.
+- **Node is found where you actually installed it.** Hooks resolve a supported toolchain through
+  `scripts/run-node.sh`, preferring your version manager over a system install.
+
+[Background Runtime Limits](#background-runtime-limits) and [Where State Lives](#where-state-lives)
+say what bounds those windows and where the files are.
+
 ## Requirements
 
 - **ChatGPT subscription (incl. Free) or OpenAI API key.**
@@ -234,10 +257,19 @@ Use it to:
 - see the latest completed job
 - confirm whether a task is still running
 
+A job's status is reconciled against its worker process before it is reported, so a background run whose worker died is not shown as running forever:
+
+- worker gone, no Codex thread started → `terminated-unknown`
+- worker gone while a Codex turn may still be running → still active, with the phase `worker-exited-turn-unknown`
+
+That second state is the one case the plugin cannot resolve on its own: the turn is server-side and the process that knew its id is gone. It clears when the turn's runtime does — see [Background Runtime Limits](#background-runtime-limits).
+
 ### `/codex:result`
 
 Shows the final stored Codex output for a finished job.
 When available, it also includes the Codex session ID so you can reopen that run directly in Codex with `codex resume <session-id>`.
+
+A run that failed without crashing — a rejected model, an unsupported parameter — stores the error text too, so a failed job says *why* it failed rather than only that it did.
 
 Examples:
 
@@ -248,7 +280,7 @@ Examples:
 
 ### `/codex:cancel`
 
-Cancels an active background Codex job.
+Cancels an active background Codex job: it records the cancellation, interrupts the Codex turn, and then kills the worker — in that order, so a crash midway never leaves an interrupted turn with no recorded outcome.
 
 Examples:
 
@@ -256,6 +288,12 @@ Examples:
 /codex:cancel
 /codex:cancel task-abc123
 ```
+
+**Notes:**
+
+- a job that finished while you were typing is reported as already finished rather than failing the command
+- naming a job whose record went stale (its worker died mid-write) repairs the record and reports the real outcome
+- a cancel is refused when the worker exited after Codex accepted the turn but before it recorded the turn id: that turn may still be running and there is nothing to address it by, so reporting it cancelled would be a lie. The job stays active until its runtime goes.
 
 ### `/codex:setup`
 
@@ -343,7 +381,19 @@ Set any of these in the environment before starting Claude Code, for example:
 export CODEX_BROKER_IDLE_SHUTDOWN_MS=1800000  # 30 minutes
 ```
 
+`CODEX_BROKER_IDLE_SHUTDOWN_MS` does double duty: it also bounds how long a job whose worker died with a turn still possibly running keeps the runtime up (the `worker-exited-turn-unknown` state above). Session end leaves the broker alive for such a job instead of killing the turn under it; once that window passes, the next session end reclaims both. With the timer disabled (`0`), the fallback is 24 hours rather than forever.
+
 These are advanced knobs for tuning resource usage in long-running or resource-constrained environments; most users will never need to touch them.
+
+### Where State Lives
+
+| What | Where | Notes |
+| --- | --- | --- |
+| jobs, logs, broker record | `$CLAUDE_PLUGIN_DATA/state/<workspace>/`, or a temp-dir fallback | `CLAUDE_PLUGIN_DATA` is only set when the plugin runs as a hook, so both locations are real. Reads check both, writes go to the current one. |
+| review-gate flag | `$CODEX_HOME/plugin-cc/config/<workspace>.json` | Durable on purpose: clearing the state dir, or a different `CLAUDE_PLUGIN_DATA`, must not silently turn the gate off. Written privately (0600) and atomically. |
+| Codex threads and auth | wherever your Codex CLI keeps them | The plugin never holds a second copy — see the [FAQ](#does-the-plugin-use-a-separate-codex-runtime). |
+
+One broker serves every session in a workspace. It is shut down by the last session out, never by a session that still has another's work in flight, and it releases its Codex thread subscriptions as clients disconnect, so a departed session's notifications never reach the next one.
 
 ### Moving The Work Over To Codex
 
@@ -364,6 +414,9 @@ Broker and background-job lifecycle:
 | [#541](https://github.com/openai/codex-plugin-cc/pull/541) | broker leaks, state races, and signal-masked command failures in the test runtime |
 | [#623](https://github.com/openai/codex-plugin-cc/pull/623) | session end no longer tears down the shared broker while another session's jobs are still using it |
 | [#652](https://github.com/openai/codex-plugin-cc/pull/652) | bounds the lifetime of detached brokers and task workers (see [Background Runtime Limits](#background-runtime-limits)) |
+| [#659](https://github.com/openai/codex-plugin-cc/pull/659) | state written under one `CLAUDE_PLUGIN_DATA` root is no longer invisible to an invocation that resolves to another, which orphaned brokers and hid jobs |
+| [#707](https://github.com/openai/codex-plugin-cc/pull/707) | the broker releases its app-server thread subscriptions when a client disconnects, instead of leaking them for its whole lifetime |
+| [#728](https://github.com/openai/codex-plugin-cc/pull/728) | a job whose worker died no longer reads as "running" forever; `/codex:status` reconciles the record against the live process |
 
 Commands and flags:
 
@@ -375,7 +428,7 @@ Commands and flags:
 | [#729](https://github.com/openai/codex-plugin-cc/pull/729) | `/codex:transfer` works with a relocated `CLAUDE_CONFIG_DIR` |
 | [#742](https://github.com/openai/codex-plugin-cc/pull/742) | `--sandbox <mode>` on `task` and `/codex:rescue` |
 | [#746](https://github.com/openai/codex-plugin-cc/pull/746) | `--model`/`--effort` on the review commands, and a warning for unrecognised options |
-| [#748](https://github.com/openai/codex-plugin-cc/pull/748) | `CLAUDE_ENV_FILE` keeps one export per key instead of growing on every session |
+| [#748](https://github.com/openai/codex-plugin-cc/pull/748) | `CLAUDE_ENV_FILE` skips re-exporting an unchanged value (its rewrite-the-file mechanism is not used: the file is shared with other plugins' hooks, so this fork only ever appends to it) |
 | [#731](https://github.com/openai/codex-plugin-cc/pull/731) | the review-gate flag is persisted outside the transient state dir, so a different `CLAUDE_PLUGIN_DATA` no longer silently disables it |
 | [#737](https://github.com/openai/codex-plugin-cc/pull/737) | hooks resolve Node through `scripts/run-node.sh`, so nvm/fnm/asdf/mise/Volta/Homebrew toolchains work under the minimal hook PATH |
 | [#747](https://github.com/openai/codex-plugin-cc/pull/747) | `runCommand` sets an explicit 256 MiB `maxBuffer`, so a large `git diff` is no longer truncated at Node's 1 MiB default |
@@ -383,6 +436,37 @@ Commands and flags:
 
 Where two of these PRs disagreed, the merge commit says which side won and why. The plugin version
 is deliberately left at the upstream number: these merges do not cut a release.
+
+Beyond the imports, this fork carries fixes for defects the imports themselves surfaced:
+
+- a busy broker refusing shutdown is reported as a refusal, not an identity rejection, so SessionEnd
+  leaves a shared runtime to the sessions still using it instead of exiting with an error
+- `scripts/run-node.sh` prefers a user-managed toolchain over a system install, which [#737](https://github.com/openai/codex-plugin-cc/pull/737)
+  had inverted (see the note under [Requirements](#requirements))
+- the durable review-gate config is written privately and atomically, so an interrupted write cannot
+  silently disable the gate
+- `--read-root` works on a resumed thread: the scoped run sends a permission profile rather than a
+  sandbox mode, so asserting the mode had refused every scoped resume — and its advice dropped the
+  write grant. A scoped run on a thread started with the sandbox disabled is still refused
+- cancelling refuses *before* taking the job's terminal claim, so a refused cancel leaves nothing
+  behind for the next one to turn into a bogus `cancelled` record
+- a job retained because its turn may still be running keeps the runtime up, stays readable in
+  `/codex:status`, and expires on a bounded window instead of pinning the broker
+- the state a job is deleted from is the state its files are deleted from, so a prune another
+  process is holding can no longer leave a record without its log and detail file
+- disabling the review gate is not outvoted by a stale enable left under another plugin-data root
+- `CLAUDE_ENV_FILE` is only ever appended to: it is shared with other plugins' hooks, and rewriting
+  it dropped whatever they had just written
+- the app-server typecheck (`npm run build`) passes
+
+Each of those came out of an adversarial review of the merges, re-run after every round of fixes;
+the reasoning behind each is in its commit message, and each has a regression test that fails
+without it.
+
+Not imported: [#733](https://github.com/openai/codex-plugin-cc/pull/733) (durable startup
+cancellation) — its behavior is already covered here by the terminal-claim mechanism, and its marker
+files would add a second source of truth for the same decision. [#761](https://github.com/openai/codex-plugin-cc/pull/761)
+(`max`/`ultra` reasoning efforts) — the same proposal was closed upstream as [#648](https://github.com/openai/codex-plugin-cc/pull/648).
 
 ## FAQ
 

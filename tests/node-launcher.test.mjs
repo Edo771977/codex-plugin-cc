@@ -417,3 +417,96 @@ test("portable launcher aligns Node with the supported toolchain that contains c
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+
+// Regression for the precedence bug this fork fixed in find_managed_node(): the
+// hardcoded system paths (/usr/local/bin, /opt/homebrew, ...) used to be tried
+// before every version-manager root, so on any machine carrying a system node
+// the managed toolchains were shadowed. The assertion below is only meaningful
+// where such a node exists (it is what the launcher would otherwise pick); where
+// it does not, the test still passes and costs nothing.
+function installManagedNode(binDir, marker) {
+  fs.mkdirSync(binDir, { recursive: true });
+  const nodePath = path.join(binDir, "node");
+  fs.writeFileSync(
+    nodePath,
+    `#!/bin/sh\nif [ "\${1:-}" = "-e" ]; then exit 0; fi\nprintf "${marker}:%s\\n" "$*"\n`,
+    "utf8"
+  );
+  fs.chmodSync(nodePath, 0o755);
+  return nodePath;
+}
+
+function installEveryManager(home) {
+  const nvmDir = path.join(home, "custom-nvm");
+  const fnmDir = path.join(home, "custom-fnm");
+  const asdfDir = path.join(home, "custom-asdf");
+  const miseDir = path.join(home, "custom-mise");
+  installManagedNode(path.join(nvmDir, "versions", "node", "v22.0.0", "bin"), "MANAGED_NVM");
+  installManagedNode(path.join(fnmDir, "node-versions", "v22.1.0", "installation", "bin"), "MANAGED_FNM");
+  installManagedNode(path.join(asdfDir, "installs", "nodejs", "22.2.0", "bin"), "MANAGED_ASDF");
+  installManagedNode(path.join(miseDir, "installs", "node", "22.3.0", "bin"), "MANAGED_MISE");
+  return {
+    NVM_DIR: nvmDir.replaceAll("\\", "/"),
+    FNM_DIR: fnmDir.replaceAll("\\", "/"),
+    ASDF_DATA_DIR: asdfDir.replaceAll("\\", "/"),
+    MISE_DATA_DIR: miseDir.replaceAll("\\", "/")
+  };
+}
+
+test("portable launcher prefers a managed toolchain over a system install with several managers present", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-node-multi-manager-"));
+  const emptyBin = path.join(home, "empty-bin");
+  fs.mkdirSync(emptyBin, { recursive: true });
+  const managerEnv = installEveryManager(home);
+  try {
+    const result = spawnSync(BASH, [LAUNCHER.replaceAll("\\", "/"), "companion.mjs", "status", "--json"], {
+      encoding: "utf8",
+      env: {
+        ...cleanVersionManagerEnv(),
+        HOME: home.replaceAll("\\", "/"),
+        PATH: emptyBin.replaceAll("\\", "/"),
+        CODEX_COMPANION_NODE: "",
+        ...managerEnv
+      }
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    // Which manager wins is deliberately not pinned: the launcher has no way to
+    // tell which one the project or the user actually selected (no .nvmrc,
+    // .tool-versions or mise config is read), so asserting one would freeze an
+    // arbitrary order. What must hold is that a managed toolchain is chosen at
+    // all rather than a system install.
+    assert.match(result.stdout, /MANAGED_(NVM|FNM|ASDF|MISE):/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("portable launcher lets CODEX_COMPANION_NODE override every installed manager", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-node-multi-manager-pinned-"));
+  const emptyBin = path.join(home, "empty-bin");
+  fs.mkdirSync(emptyBin, { recursive: true });
+  const managerEnv = installEveryManager(home);
+  const pinnedNode = installManagedNode(path.join(home, "pinned", "bin"), "PINNED_NODE");
+  try {
+    const result = spawnSync(BASH, [LAUNCHER.replaceAll("\\", "/"), "companion.mjs", "status", "--json"], {
+      encoding: "utf8",
+      env: {
+        ...cleanVersionManagerEnv(),
+        HOME: home.replaceAll("\\", "/"),
+        PATH: emptyBin.replaceAll("\\", "/"),
+        CODEX_COMPANION_NODE: pinnedNode.replaceAll("\\", "/"),
+        ...managerEnv
+      }
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    // The one way to pin a runtime today, and the answer to "which manager?"
+    // until the launcher learns to read the active one.
+    assert.match(result.stdout, /PINNED_NODE:/);
+    assert.doesNotMatch(result.stdout, /MANAGED_(NVM|FNM|ASDF|MISE):/);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

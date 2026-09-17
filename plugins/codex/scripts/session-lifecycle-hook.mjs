@@ -4,6 +4,8 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { isPidAlive, terminateProcessTree } from "./lib/process.mjs";
+import { reconcileJobLiveness } from "./lib/job-control.mjs";
+import { brokerIdleShutdownMs } from "./lib/lifecycle-limits.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
   LOG_FILE_ENV,
@@ -83,6 +85,16 @@ function setEnv(name, value) {
   const prefix = `export ${name}=`;
   const line = `${prefix}${shellEscape(value)}`;
 
+  // CLAUDE_ENV_FILE is shared with every other plugin's SessionStart hook and is
+  // append-only by convention. Rewriting it (read, filter, rename) drops any
+  // export another hook appended between the read and the rename, and the
+  // rename replaces the file, discarding its mode along with it. So append.
+  //
+  // That means a value that changes every session (the session id, the
+  // transcript path) adds a line every session: the shell takes the last
+  // export for a key, so the file stays correct while it grows. Only an
+  // unchanged value is skipped. Bounded growth is the price of never
+  // destroying another plugin's export.
   let content = "";
   try {
     content = fs.readFileSync(envFile, "utf8");
@@ -90,12 +102,19 @@ function setEnv(name, value) {
     if (err.code !== "ENOENT") throw err;
   }
 
-  const lines = content.split(/\r?\n/).filter((l) => l && !l.startsWith(prefix));
-  lines.push(line);
+  const existing = content
+    .split(/\r?\n/)
+    .filter((entry) => entry.startsWith(prefix))
+    .at(-1);
+  if (existing === line) {
+    return;
+  }
 
-  const tmp = `${envFile}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, lines.join("\n") + "\n", "utf8");
-  fs.renameSync(tmp, envFile);
+  // Always open with a newline rather than deciding from the read above: a
+  // hook appending an unterminated line between that read and this write would
+  // otherwise run into ours, losing both exports. A blank line costs nothing to
+  // the shell that sources this file.
+  fs.appendFileSync(envFile, `\n${line}\n`, "utf8");
 }
 
 // A pid-less active record has no liveness signal at all (current code
@@ -112,6 +131,33 @@ function isStaleJobRecord(job) {
     return false;
   }
   return Date.now() - timestamp > ACTIVE_JOB_STALENESS_MS;
+}
+
+// A record retained because its worker died with a turn still possibly running
+// has no pid to probe, so the generic pid-less rule (a day) would keep it
+// "running" — and keep it pinning the broker — for a day. The turn it protects
+// cannot outlive the broker anyway: its client is gone, so the broker idles out
+// on its own timer. Bound the protection to that same window.
+function retainedOrphanExpired(job, env = process.env) {
+  if (job?.workerExited !== true) {
+    return false;
+  }
+  // This record is why SessionEnd declines to tear the broker down, so here
+  // "cannot tell" must not mean "protected forever" — isStaleJobRecord()'s
+  // conservative reading of an unparseable timestamp would do exactly that. A
+  // record with no readable timestamp has outlived anything it could protect.
+  const reference = job.updatedAt ?? job.createdAt ?? null;
+  const timestamp = reference ? Date.parse(reference) : Number.NaN;
+  if (!Number.isFinite(timestamp)) {
+    return true;
+  }
+  // The broker's idle timer is what actually ends the turn, so it sets the
+  // window. With that timer disabled (CODEX_BROKER_IDLE_SHUTDOWN_MS=0) nothing
+  // would end it, so fall back to the generic staleness bound rather than
+  // pinning the broker — and its app-server and MCP servers — indefinitely.
+  const idleMs = brokerIdleShutdownMs(env);
+  const windowMs = Number.isFinite(idleMs) && idleMs > 0 ? idleMs : ACTIVE_JOB_STALENESS_MS;
+  return Date.now() - timestamp > windowMs;
 }
 
 // Nothing else transitions the record of a worker that died without its
@@ -147,7 +193,12 @@ async function reapDeadWorkerJobs(workspaceRoot, { excludeSessionId = null, cwd 
       continue;
     }
     jobsAwaitingInterrupt -= 1;
-    const workerDead = job.pid != null ? !isPidAlive(job.pid) : isStaleJobRecord(job);
+    const workerDead =
+      job.pid != null
+        ? !isPidAlive(job.pid)
+        : job.workerExited === true
+          ? retainedOrphanExpired(job)
+          : isStaleJobRecord(job);
     if (!workerDead) {
       continue;
     }
@@ -222,24 +273,25 @@ function hasActiveJobsFromOtherSessions(workspaceRoot, sessionId) {
     if (job.pid != null) {
       return isPidAlive(job.pid);
     }
+    if (job.workerExited === true) {
+      return !retainedOrphanExpired(job);
+    }
     return !isStaleJobRecord(job);
   });
 }
 
 async function cleanupSessionJobs(cwd, sessionId, { interruptTurns = false, interruptDeadline = null } = {}) {
   if (!cwd || !sessionId) {
-    return;
+    return { retainedOrphans: 0 };
   }
 
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const stateFile = resolveStateFile(workspaceRoot);
-  if (!fs.existsSync(stateFile)) {
-    return;
-  }
-
+  // loadState() is candidate-aware and already returns an empty job list when
+  // nothing exists in any root; a raw existsSync() against the primary candidate
+  // alone would miss a session whose jobs only live in the fallback root.
   const sessionJobs = loadState(workspaceRoot).jobs.filter((job) => job.sessionId === sessionId);
   if (sessionJobs.length === 0) {
-    return;
+    return { retainedOrphans: 0 };
   }
 
   const completedAt = new Date().toISOString();
@@ -251,6 +303,10 @@ async function cleanupSessionJobs(cwd, sessionId, { interruptTurns = false, inte
     errorMessage: "Cancelled: the Claude session ended while the job was still running."
   };
   const cancelledIds = new Set();
+  // Jobs left active because their turn may still be running: the broker must
+  // outlive this hook run for them, and hasActiveJobsFromOtherSessions() will
+  // not speak for them — they belong to the session that is ending.
+  let retainedOrphans = 0;
   const killedPids = [];
   const finishingJobs = [];
   interruptDeadline = interruptDeadline ?? Date.now() + TURN_INTERRUPT_BUDGET_MS;
@@ -266,7 +322,6 @@ async function cleanupSessionJobs(cwd, sessionId, { interruptTurns = false, inte
     if (!stillRunning) {
       continue;
     }
-    jobsAwaitingInterrupt -= 1;
     // The state snapshot can carry the queued record's pid: null while the
     // worker has since written its real pid (and turn identity) to the job
     // file — and the terminal patches below null the pid field, destroying
@@ -283,6 +338,35 @@ async function cleanupSessionJobs(cwd, sessionId, { interruptTurns = false, inte
     } catch {
       // Keep the snapshot values.
     }
+    // A dead worker still gets its terminal record below — that is what keeps
+    // /codex:status from answering "No job found" for the session that just
+    // ended. Reconciliation is consulted only for the one case where writing
+    // that record would be a lie, and it reads the values captured above
+    // rather than the snapshot: the snapshot's pid can be null while the
+    // worker has long since published its real pid and turn identity, which
+    // would both skip this check and misjudge the turn as unidentified.
+    const reconciled = reconcileJobLiveness({ ...job, pid: workerPid, threadId, turnId });
+    if (reconciled.workerExited && threadId && !turnId) {
+      // The worker died after turn/start was accepted but before it recorded a
+      // turn id, so the Codex turn may still be running and there is nothing to
+      // interrupt it by. Cancelling the record here would claim an outcome that
+      // did not happen; leave it active (its phase says why) for the next
+      // status query. The verdict is persisted instead of the pid: writing a
+      // dead pid back would let another session's dead-worker reaper fail the
+      // record and stop it pinning the broker — tearing the runtime down under
+      // the very turn this retain protects. A pid-less active record keeps the
+      // broker up (bounded by the staleness rule) and reconciles from the flag.
+      upsertJob(workspaceRoot, {
+        id: job.id,
+        phase: reconciled.phase,
+        pid: null,
+        threadId,
+        workerExited: true
+      });
+      retainedOrphans += 1;
+      continue;
+    }
+    jobsAwaitingInterrupt -= 1;
     // The worker may be recording its own terminal outcome right now; only
     // cancel jobs whose terminal status this hook wins — unless the claim is
     // orphaned (its owner died before writing a terminal record), in which
@@ -430,6 +514,8 @@ async function cleanupSessionJobs(cwd, sessionId, { interruptTurns = false, inte
       return isActiveJob(job);
     });
   });
+
+  return { retainedOrphans };
 }
 
 function handleSessionStart(input) {
@@ -462,7 +548,20 @@ async function handleSessionEnd(input) {
     interruptTurns,
     interruptDeadline
   });
-  await cleanupSessionJobs(cwd, sessionId, { interruptTurns, interruptDeadline });
+  const cleanup = await cleanupSessionJobs(cwd, sessionId, { interruptTurns, interruptDeadline });
+
+  // A turn this session could not interrupt — its worker died before publishing
+  // a turn id — may still be running on this broker. The guard below speaks
+  // only for other sessions' work, so without this the same hook run would
+  // tear the runtime down under the turn the retain exists to protect.
+  //
+  // What ends the wait: normally the broker's own idle timer, since the turn's
+  // client is gone. With that timer disabled the next session end in this
+  // workspace reclaims the broker once the record passes the staleness bound
+  // (see retainedOrphanExpired), so the runtime is held, never stranded.
+  if (cleanup?.retainedOrphans > 0) {
+    return;
+  }
 
   // The broker and state dir are workspace-shared, not session-owned. If any
   // other session still has work in flight, tearing the broker down would

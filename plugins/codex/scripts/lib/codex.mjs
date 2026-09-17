@@ -120,6 +120,26 @@ function sandboxModeForPolicy(policy) {
   return null;
 }
 
+// A scoped run constrains reads through a permission profile, which cannot
+// take back what a thread started with `danger-full-access` already has: the
+// sandbox is off for that thread, so the scope would be a promise this plugin
+// cannot keep.
+function assertScopedNotEscalated(threadId, response, { resumed }) {
+  const effectiveMode = sandboxModeForPolicy(response?.sandbox);
+  if (effectiveMode !== "danger-full-access") {
+    return;
+  }
+  throw new Error(
+    `Thread ${threadId} runs with the Codex sandbox disabled (danger-full-access), so --read-root cannot scope it. ` +
+      (resumed
+        ? "Start a fresh thread with --fresh to run scoped."
+        : // A fresh thread is what just started, so "--fresh" would only repeat
+          // this. The mode came from the Codex config that applies here.
+          "It was started that way by the Codex config in effect (sandbox_mode in config.toml), " +
+          "so drop --read-root or change that default to run scoped.")
+  );
+}
+
 function assertResumedSandbox(threadId, requestedMode, response) {
   if (!requestedMode || !SANDBOX_POLICY_TYPES.has(requestedMode)) {
     return;
@@ -1335,7 +1355,18 @@ export async function runAppServerTurn(cwd, options = {}) {
           write: options.write,
           ephemeral: false
         });
-        assertResumedSandbox(options.resumeThreadId, options.sandbox, response);
+        // With read roots, buildThreadAccessParams() deliberately sends a
+        // scoped permission profile and no `sandbox`, so the app-server's
+        // reported mode is not the one this turn requested: asserting it
+        // refused every `--read-root` resume, and the error's own advice
+        // (resume with the reported mode) silently dropped the write grant.
+        // The escalation half of that check still applies, though — a thread
+        // started with the sandbox disabled is not scoped by any profile.
+        if (options.readRoots?.length > 0) {
+          assertScopedNotEscalated(options.resumeThreadId, response, { resumed: true });
+        } else {
+          assertResumedSandbox(options.resumeThreadId, options.sandbox, response);
+        }
         threadId = response.thread.id;
       } else {
         emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
@@ -1347,6 +1378,12 @@ export async function runAppServerTurn(cwd, options = {}) {
           ephemeral: options.persistThread ? false : true,
           threadName: options.persistThread ? options.threadName : options.threadName ?? null
         });
+        // A default config can start a thread with the sandbox disabled, in
+        // which case the scope this run asked for would not hold here either —
+        // and "start a fresh thread" is the advice the resume path gives.
+        if (options.readRoots?.length > 0) {
+          assertScopedNotEscalated(response.thread.id, response, { resumed: false });
+        }
         threadId = response.thread.id;
       }
     } catch (error) {

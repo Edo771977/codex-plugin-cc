@@ -1,7 +1,7 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { getConfig, listJobs, readJobFile, resolveJobFileCandidates } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -22,6 +22,53 @@ function filterJobsForCurrentSession(jobs, options = {}) {
     return jobs;
   }
   return jobs.filter((job) => job.sessionId === sessionId);
+}
+
+function isActiveJob(job) {
+  return job.status === "queued" || job.status === "running";
+}
+
+export function reconcileJobLiveness(job, options = {}) {
+  if (!isActiveJob(job)) {
+    return job;
+  }
+  // A record whose worker was already found gone carries the verdict itself:
+  // the pid is dropped when that is persisted (a dead pid would let the
+  // dead-worker reaper fail the job and stop it pinning the broker, under a
+  // turn that may still be running), so there is nothing left to probe.
+  if (job.workerExited === true && job.threadId) {
+    return { ...job, status: "running", phase: "worker-exited-turn-unknown", pid: null, workerExited: true };
+  }
+  if (!Number.isSafeInteger(job.pid) || job.pid <= 0) {
+    return job;
+  }
+
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+  try {
+    killImpl(job.pid, 0);
+    return job;
+  } catch (error) {
+    if (error?.code === "EPERM") {
+      return job;
+    }
+    if (error?.code === "ESRCH") {
+      if (job.threadId) {
+        return {
+          ...job,
+          status: "running",
+          phase: "worker-exited-turn-unknown",
+          pid: null,
+          workerExited: true
+        };
+      }
+      return { ...job, status: "terminated-unknown", phase: "worker-exited" };
+    }
+    return job;
+  }
+}
+
+export function reconcileJobsLiveness(jobs, options = {}) {
+  return jobs.map((job) => reconcileJobLiveness(job, options));
 }
 
 function getJobTypeLabel(job) {
@@ -181,11 +228,12 @@ export function enrichJob(job, options = {}) {
 }
 
 export function readStoredJob(workspaceRoot, jobId) {
-  const jobFile = resolveJobFile(workspaceRoot, jobId);
-  if (!fs.existsSync(jobFile)) {
-    return null;
+  for (const jobFile of resolveJobFileCandidates(workspaceRoot, jobId)) {
+    if (fs.existsSync(jobFile)) {
+      return readJobFile(jobFile);
+    }
   }
-  return readJobFile(jobFile);
+  return null;
 }
 
 function matchJobReference(jobs, reference, predicate = () => true) {
@@ -213,7 +261,9 @@ function matchJobReference(jobs, reference, predicate = () => true) {
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
+  const jobs = sortJobsNewestFirst(
+    reconcileJobsLiveness(filterJobsForCurrentSession(listJobs(workspaceRoot), options), options)
+  );
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
@@ -241,7 +291,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
 
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = sortJobsNewestFirst(reconcileJobsLiveness(listJobs(workspaceRoot), options));
   const selected = matchJobReference(jobs, reference);
   if (!selected) {
     throw new Error(`No job found for "${reference}". Run /codex:status to inspect known jobs.`);
@@ -253,13 +303,18 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   };
 }
 
-export function resolveResultJob(cwd, reference) {
+export function resolveResultJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
+  const scopedJobs = reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot), options);
+  const jobs = sortJobsNewestFirst(reconcileJobsLiveness(scopedJobs, options));
   const selected = matchJobReference(
     jobs,
     reference,
-    (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled"
+    (job) =>
+      job.status === "completed" ||
+      job.status === "failed" ||
+      job.status === "cancelled" ||
+      (Boolean(reference) && job.status === "terminated-unknown")
   );
 
   if (selected) {
@@ -280,15 +335,31 @@ export function resolveResultJob(cwd, reference) {
 
 export function resolveCancelableJob(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const storedJobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = sortJobsNewestFirst(reconcileJobsLiveness(listJobs(workspaceRoot), options));
   const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
 
   if (reference) {
-    const selected = matchJobReference(activeJobs, reference);
-    if (!selected) {
-      throw new Error(`No active job found for "${reference}".`);
+    const selected = activeJobs.some((job) => job.id === reference || job.id.startsWith(reference))
+      ? matchJobReference(activeJobs, reference)
+      : null;
+    if (selected) {
+      return { workspaceRoot, job: selected };
     }
-    return { workspaceRoot, job: selected };
+    // Reconciliation reports a job whose worker is gone as terminated-unknown,
+    // which would end the cancel here. When the worker did leave a detail file
+    // behind, that record is exactly what the cancel path repairs and reports
+    // ("already finished", or a claim it adopts), so resolve against the stored
+    // record instead. With no file on disk there is genuinely nothing to act
+    // on, and the error below stands.
+    const storedActiveJobs = storedJobs.filter((job) => job.status === "queued" || job.status === "running");
+    const storedSelected = storedActiveJobs.some((job) => job.id === reference || job.id.startsWith(reference))
+      ? matchJobReference(storedActiveJobs, reference)
+      : null;
+    if (storedSelected && readStoredJob(workspaceRoot, storedSelected.id)) {
+      return { workspaceRoot, job: storedSelected };
+    }
+    throw new Error(`No active job found for "${reference}".`);
   }
 
   const sessionScopedActiveJobs = filterJobsForCurrentSession(activeJobs, options);

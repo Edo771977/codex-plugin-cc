@@ -39,6 +39,8 @@ import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
   readStoredJob,
+  reconcileJobLiveness,
+  reconcileJobsLiveness,
   resolveCancelableJob,
   resolveResultJob,
   sortJobsNewestFirst
@@ -392,7 +394,7 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
+  const jobs = sortJobsNewestFirst(reconcileJobsLiveness(listJobs(workspaceRoot))).filter((job) => job.id !== options.excludeJobId);
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
   const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
   if (activeTask) {
@@ -1149,7 +1151,7 @@ function handleTaskResumeCandidate(argv) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentClaudeSessionId();
-  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
+  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(reconcileJobsLiveness(listJobs(workspaceRoot))));
   const candidate = findLatestResumableTaskJob(jobs);
 
   const payload = {
@@ -1191,6 +1193,21 @@ async function handleCancel(argv) {
   // worker has since written its real pid to the job file — and the terminal
   // writes below null the pid field, so capture the fresher value first.
   let workerPid = existing.pid ?? job.pid ?? Number.NaN;
+
+  // A worker that exited after turn/start was accepted, but before it recorded
+  // a turn id, leaves a Codex turn that may still be running and nothing to
+  // address it by, so the cancel refuses. It refuses here, before the terminal
+  // claim below: the claim is never released, and a leaked cancel-intent claim
+  // makes the next cancel (or SessionEnd) reassert it into a cancelled record
+  // for the turn that is still running — the very outcome this refusal exists
+  // to prevent. No identity wait can help either: the worker that would
+  // publish the turn id is already gone.
+  const reconciledForCancel = reconcileJobLiveness({ ...job, ...existing });
+  if (reconciledForCancel.workerExited && threadId && !turnId) {
+    throw new Error(
+      `Cannot safely cancel ${job.id}: the worker exited after turn/start was accepted, but the turn id is not yet known. The Codex turn may still be running.`
+    );
+  }
 
   // Claim the terminal status first: if the worker finished in the meantime,
   // its completed/failed record stands and there is nothing left to cancel.

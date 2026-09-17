@@ -17,6 +17,7 @@ const CODEX_HOME_ENV = "CODEX_HOME";
 const CONFIG_DIR_NAME = path.join("plugin-cc", "config");
 const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
+const STATE_LOCK_DIR_NAME = ".state.lock";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
 const MIN_TERMINAL_JOBS = 10;
@@ -49,10 +50,34 @@ function resolveWorkspaceKey(cwd) {
   return `${slug}-${hash}`;
 }
 
-export function resolveStateDir(cwd) {
+// CLAUDE_PLUGIN_DATA is only present when the current invocation runs as a
+// plugin hook; a directly-invoked CLI call (or a hook whose env didn't
+// propagate it) resolves to the tmpdir fallback instead. Since the state
+// root is derived from ambient environment rather than anything persisted,
+// two invocations for the *same* workspace can land on different roots --
+// the primary root is still the write target for new/updated state, but
+// reads check every candidate so state written under one root is never
+// invisible to a later invocation that resolves to the other.
+function stateRootCandidates() {
   const pluginDataDir = process.env[PLUGIN_DATA_ENV];
-  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
-  return path.join(stateRoot, resolveWorkspaceKey(cwd));
+  return pluginDataDir
+    ? [path.join(pluginDataDir, "state"), FALLBACK_STATE_ROOT_DIR]
+    : [FALLBACK_STATE_ROOT_DIR];
+}
+
+export function resolveStateDir(cwd) {
+  const [primaryRoot] = stateRootCandidates();
+  return path.join(primaryRoot, resolveWorkspaceKey(cwd));
+}
+
+/**
+ * All directories that could hold this workspace's state, primary root
+ * first. Use for reads that must not miss state written under a different
+ * root than the current invocation resolves to.
+ */
+export function resolveStateDirCandidates(cwd) {
+  const dirName = resolveWorkspaceKey(cwd);
+  return stateRootCandidates().map((root) => path.join(root, dirName));
 }
 
 export function resolveConfigFile(cwd) {
@@ -76,26 +101,79 @@ export function ensureStateDir(cwd) {
   }
 }
 
-export function loadState(cwd) {
-  const stateFile = resolveStateFile(cwd);
+function readStateFileIfValid(stateFile) {
   if (!fs.existsSync(stateFile)) {
+    return null;
+  }
+  try {
+    return JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+// Unlike the broker session (at most one meaningful record per workspace,
+// so "first candidate found" is a correct selection), jobs are a growing
+// collection that can genuinely differ across roots -- a job started while
+// CLAUDE_PLUGIN_DATA was set and another started while it was unset are
+// both real and non-conflicting. Returning only the first candidate's job
+// list would silently hide whichever root wasn't picked, leaving the exact
+// cross-root invisibility this fix targets for status/result/cancel
+// whenever *both* roots happen to have a state.json (a reachable legacy
+// state after invocations alternated). So every candidate's jobs are
+// merged instead, keeping the more recently updated copy if the same job
+// id somehow appears in more than one.
+export function loadState(cwd) {
+  const parsedCandidates = resolveStateDirCandidates(cwd)
+    .map((stateDir) => readStateFileIfValid(path.join(stateDir, STATE_FILE_NAME)))
+    .filter((parsed) => parsed != null);
+
+  if (parsedCandidates.length === 0) {
     return defaultState();
   }
 
-  try {
-    const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-    return {
-      ...defaultState(),
-      ...parsed,
-      config: {
-        ...defaultState().config,
-        ...(parsed.config ?? {})
-      },
-      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
-    };
-  } catch {
-    return defaultState();
+  const jobsById = new Map();
+  for (const parsed of parsedCandidates) {
+    for (const job of Array.isArray(parsed.jobs) ? parsed.jobs : []) {
+      const existing = jobsById.get(job.id);
+      if (!existing || String(job.updatedAt ?? "") > String(existing.updatedAt ?? "")) {
+        jobsById.set(job.id, job);
+      }
+    }
   }
+
+  // Like jobs, config can genuinely differ across roots depending on which
+  // invocation wrote it -- e.g. `/codex:setup --enable-review-gate` running
+  // without CLAUDE_PLUGIN_DATA writes stopReviewGate to the fallback root,
+  // which a later invocation with CLAUDE_PLUGIN_DATA set would never see if
+  // only the primary candidate's config were read. A boolean flag here is
+  // an opt-in toward stricter/safer behavior, so any candidate setting it
+  // true wins over a stale false elsewhere -- reconciling by "primary wins"
+  // could silently downgrade an explicitly-enabled gate.
+  //
+  // Candidates are folded in reverse (fallback first, primary last) so the
+  // primary root wins for anything that is not a boolean. The previous
+  // "first writer wins" rule was dead for every key defaults already define —
+  // which is all of them — so a non-boolean setting could never be read back
+  // from any root.
+  const mergedConfig = { ...defaultState().config };
+  for (const parsed of [...parsedCandidates].reverse()) {
+    for (const [key, value] of Object.entries(parsed.config ?? {})) {
+      if (typeof value === "boolean") {
+        mergedConfig[key] = mergedConfig[key] === true || value === true;
+      } else {
+        mergedConfig[key] = value;
+      }
+    }
+  }
+
+  const [primary] = parsedCandidates;
+  return {
+    ...defaultState(),
+    ...primary,
+    config: mergedConfig,
+    jobs: [...jobsById.values()]
+  };
 }
 
 // Shared by the pruner, the session-end broker guard, and the dead-worker
@@ -131,10 +209,59 @@ function pruneJobs(jobs) {
 }
 
 function resolveStateLockDir(cwd) {
-  return path.join(resolveStateDir(cwd), ".state.lock");
+  return path.join(resolveStateDir(cwd), STATE_LOCK_DIR_NAME);
 }
 
-function saveStateLocked(cwd, state) {
+// Rewriting another root's state.json is a read-modify-write on a file whose
+// own lock is not the one saveState() holds: a process whose primary IS that
+// root can be mid-update, and the rename would drop everything it just wrote.
+// So take that root's lock too -- but never wait for it. Two processes holding
+// each other's primary lock would deadlock, and this prune is not urgent: the
+// pruned ids stay pruned in this root, and the next save re-runs it.
+// Everything a single root holds for one job: its detail file, its terminal
+// claim, and its log when the log lives in that root.
+function removeJobArtifacts(stateDir, job) {
+  const jobsDir = path.join(stateDir, JOBS_DIR_NAME);
+  removeFileIfExists(path.join(jobsDir, `${job.id}.json`));
+  removeFileIfExists(path.join(jobsDir, `${job.id}.terminal`));
+  if (typeof job.logFile === "string" && job.logFile.startsWith(`${stateDir}${path.sep}`)) {
+    removeFileIfExists(job.logFile);
+  }
+}
+
+function pruneOtherStateRoot(otherStateDir, retainedIds, knownIds) {
+  const otherStateFile = path.join(otherStateDir, STATE_FILE_NAME);
+  if (!fs.existsSync(otherStateFile)) {
+    return;
+  }
+  try {
+    withLockSync(
+      path.join(otherStateDir, STATE_LOCK_DIR_NAME),
+      () => {
+        // Re-read under the lock: the copy this decision was made from could
+        // have been replaced while the lock was being taken.
+        const otherParsed = readStateFileIfValid(otherStateFile);
+        const otherJobs = Array.isArray(otherParsed?.jobs) ? otherParsed.jobs : [];
+        const dropped = (job) => !retainedIds.has(job.id) && knownIds.has(job.id);
+        const prunedOtherJobs = otherJobs.filter((job) => !dropped(job));
+        if (prunedOtherJobs.length === otherJobs.length) {
+          return;
+        }
+        writeJsonFileAtomic(otherStateFile, { ...otherParsed, jobs: prunedOtherJobs });
+        for (const job of otherJobs) {
+          if (dropped(job)) {
+            removeJobArtifacts(otherStateDir, job);
+          }
+        }
+      },
+      { timeoutMs: 0 }
+    );
+  } catch {
+    // Busy or unlockable: leave that root alone rather than racing its owner.
+  }
+}
+
+function saveStateLocked(cwd, state, options = {}) {
   const previousJobs = loadState(cwd).jobs;
   const nextJobs = pruneJobs(state.jobs ?? []);
   const nextState = {
@@ -147,16 +274,40 @@ function saveStateLocked(cwd, state) {
   };
 
   const retainedIds = new Set(nextJobs.map((job) => job.id));
+  const primaryStateDir = resolveStateDir(cwd);
   for (const job of previousJobs) {
     if (retainedIds.has(job.id)) {
       continue;
     }
-    removeFileIfExists(resolveJobFile(cwd, job.id));
-    removeFileIfExists(resolveJobClaimFile(cwd, job.id));
-    removeFileIfExists(job.logFile);
+    // Only this root's copies. Pruning another root's state.json is
+    // best-effort (it needs that root's lock), so deleting its files here
+    // would leave a record that is merged back in — and rewritten into the
+    // primary — with its detail file, claim and log already gone. Each root's
+    // files go when its own record does.
+    removeJobArtifacts(primaryStateDir, job);
   }
 
   writeJsonFileAtomic(resolveStateFile(cwd), nextState);
+
+  // previousJobs is the merged view across every candidate root (see loadState()),
+  // so a job dropped from state.jobs here may have originated entirely in a root
+  // other than the one just written above. Without this, that root's own
+  // state.json still holds its own untouched copy, and the very next loadState()
+  // merges it right back in -- deletions could never stick for a job that lives
+  // only in a non-primary root. Prune every other candidate root down to the same
+  // retained set; new and updated jobs are still only ever written to the primary
+  // root, above. This only ever removes.
+  // Ids the caller actually decided about. updateState() hands down the snapshot
+  // it mutated, which closes the window between its read and the re-read above;
+  // a direct saveState() has no such snapshot to offer, so the re-read is the
+  // best available. Anything in another root outside this set arrived after the
+  // caller looked and is nobody's to drop here.
+  const knownIds = options.knownIds ?? new Set(previousJobs.map((job) => job.id));
+  const [, ...otherStateDirs] = resolveStateDirCandidates(cwd);
+  for (const otherStateDir of otherStateDirs) {
+    pruneOtherStateRoot(otherStateDir, retainedIds, knownIds);
+  }
+
   return nextState;
 }
 
@@ -169,8 +320,9 @@ export function updateState(cwd, mutate) {
   ensureStateDir(cwd);
   return withLockSync(resolveStateLockDir(cwd), () => {
     const state = loadState(cwd);
+    const knownIds = new Set(state.jobs.map((job) => job.id));
     mutate(state);
-    return saveStateLocked(cwd, state);
+    return saveStateLocked(cwd, state, { knownIds });
   });
 }
 
@@ -227,11 +379,49 @@ function writeDurableConfig(cwd, config) {
   return nextConfig;
 }
 
+// Same lock discipline as pruneOtherStateRoot(): that root's own lock, never
+// waited on. A config copy this misses is corrected by the next write, and by
+// the durable config, which is the authority.
+function syncOtherStateRootConfig(otherStateDir, config) {
+  const otherStateFile = path.join(otherStateDir, STATE_FILE_NAME);
+  if (!fs.existsSync(otherStateFile)) {
+    return;
+  }
+  try {
+    withLockSync(
+      path.join(otherStateDir, STATE_LOCK_DIR_NAME),
+      () => {
+        const otherParsed = readStateFileIfValid(otherStateFile);
+        if (!otherParsed) {
+          return;
+        }
+        writeJsonFileAtomic(otherStateFile, {
+          ...otherParsed,
+          config: { ...(otherParsed.config ?? {}), ...config }
+        });
+      },
+      { timeoutMs: 0 }
+    );
+  } catch {
+    // Busy or unlockable: leave that root alone rather than racing its owner.
+  }
+}
+
 export function setConfig(cwd, key, value) {
   const nextConfig = writeDurableConfig(cwd, { ...getConfig(cwd), [key]: value });
   updateState(cwd, (state) => {
     state.config = { ...state.config, ...nextConfig };
   });
+  // The cached copy in every other root has to follow. loadState() merges
+  // booleans with OR — deliberately, so a gate enabled under one root is not
+  // downgraded by a stale false under another — which also means a stranded
+  // true would outvote this write forever whenever the durable config cannot
+  // be read. Writing the new value everywhere keeps that safety direction
+  // without making "disable" unreachable.
+  const [, ...otherStateDirs] = resolveStateDirCandidates(cwd);
+  for (const otherStateDir of otherStateDirs) {
+    syncOtherStateRootConfig(otherStateDir, nextConfig);
+  }
   return nextConfig;
 }
 
@@ -267,4 +457,24 @@ export function resolveJobFile(cwd, jobId) {
 export function resolveJobClaimFile(cwd, jobId) {
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.terminal`);
+}
+
+/**
+ * Every path a job's terminal-claim file could be at, primary root first. The
+ * claim lives beside the job's detail file, so it follows the same candidate
+ * roots; unlike resolveJobClaimFile() this never creates a directory.
+ */
+export function resolveJobClaimFileCandidates(cwd, jobId) {
+  return resolveStateDirCandidates(cwd).map((stateDir) => path.join(stateDir, JOBS_DIR_NAME, `${jobId}.terminal`));
+}
+
+/**
+ * Every path a job's detail file could be at, primary root first. A job
+ * listed via loadState()/listJobs() (which already searches every
+ * candidate root) may have had its detail file written under a different
+ * root than resolveJobFile()'s current primary; read lookups should not
+ * miss it just because it isn't in the root a fresh call resolves to.
+ */
+export function resolveJobFileCandidates(cwd, jobId) {
+  return resolveStateDirCandidates(cwd).map((stateDir) => path.join(stateDir, JOBS_DIR_NAME, `${jobId}.json`));
 }

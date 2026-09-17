@@ -8,8 +8,12 @@ import { spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir } from "./helpers.mjs";
+import { readStoredJob } from "../plugins/codex/scripts/lib/job-control.mjs";
+import { acquireLockSync, releaseLock } from "../plugins/codex/scripts/lib/locking.mjs";
 import {
   getConfig,
+  loadState,
+  resolveConfigFile,
   listJobs,
   resolveJobFile,
   resolveJobLogFile,
@@ -91,6 +95,200 @@ test("review-gate config remains authoritative when CLAUDE_PLUGIN_DATA changes",
   } finally {
     if (previousCodexHome == null) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previousCodexHome;
     if (previousPluginData == null) delete process.env.CLAUDE_PLUGIN_DATA; else process.env.CLAUDE_PLUGIN_DATA = previousPluginData;
+  }
+});
+
+// The reverse (state written *with* CLAUDE_PLUGIN_DATA set, later read with
+// it unset) isn't fixable this way: an unset env var carries no trace of
+// what value it previously held, so there's nothing to check beyond the
+// always-known tmpdir fallback. This direction is the one with concrete
+// real-world evidence in the issue (a broker registered under the tmpdir
+// fallback, later orphaned by a lookup that ran with CLAUDE_PLUGIN_DATA set).
+test("loadState finds state written without CLAUDE_PLUGIN_DATA when the current invocation has it set", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+
+  try {
+    delete process.env.CLAUDE_PLUGIN_DATA;
+    saveState(workspace, { config: { stopReviewGate: true }, jobs: [] });
+
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+    const state = loadState(workspace);
+
+    assert.equal(state.config.stopReviewGate, true);
+  } finally {
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
+});
+
+// Caught in review: jobs are a growing collection, not a single pointer like
+// the broker session -- a job started while CLAUDE_PLUGIN_DATA was set and a
+// different job started while it was unset are both real and non-
+// conflicting, so loadState() must merge every candidate's jobs rather than
+// returning only the first state.json found (which would silently hide
+// whichever root wasn't picked, for every status/result/cancel lookup, any
+// time both roots happen to have a state.json -- a reachable legacy state
+// after invocations alternated).
+function writeStateFileDirectly(stateDir, state) {
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify(state, null, 2)}\n`, "utf8");
+}
+
+test("loadState merges jobs from every candidate root instead of only the first found", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+
+  try {
+    // Written directly (not via saveState()) so this test exercises only
+    // loadState()'s read-side merge, independent of saveState()'s own
+    // write/deletion-propagation behavior (covered separately below).
+    delete process.env.CLAUDE_PLUGIN_DATA;
+    writeStateFileDirectly(resolveStateDir(workspace), {
+      config: {},
+      jobs: [{ id: "job-fallback", status: "running", updatedAt: "2026-08-19T00:00:00.000Z" }]
+    });
+
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+    writeStateFileDirectly(resolveStateDir(workspace), {
+      config: {},
+      jobs: [{ id: "job-plugin-data", status: "running", updatedAt: "2026-08-19T00:01:00.000Z" }]
+    });
+
+    const state = loadState(workspace);
+    const jobIds = state.jobs.map((job) => job.id).sort();
+
+    assert.deepEqual(jobIds, ["job-fallback", "job-plugin-data"]);
+  } finally {
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
+});
+
+// Caught in review: config (like jobs) can genuinely differ across roots --
+// e.g. `/codex:setup --enable-review-gate` running without CLAUDE_PLUGIN_DATA
+// writes stopReviewGate to the fallback root, which a later invocation with
+// CLAUDE_PLUGIN_DATA set (a different primary) would never see if only the
+// primary candidate's config were read. Unlike the sibling test above (only
+// one root has state.json, so "primary" trivially picks the only candidate
+// available either way), this exercises the actual bug: *both* roots have
+// state, and the non-primary one is the one with the flag enabled.
+test("loadState merges config across roots, preferring an enabled boolean over a stale disabled one", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+
+  try {
+    delete process.env.CLAUDE_PLUGIN_DATA;
+    writeStateFileDirectly(resolveStateDir(workspace), {
+      config: { stopReviewGate: true },
+      jobs: []
+    });
+
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+    writeStateFileDirectly(resolveStateDir(workspace), {
+      config: { stopReviewGate: false },
+      jobs: []
+    });
+
+    const state = loadState(workspace);
+
+    assert.equal(state.config.stopReviewGate, true);
+  } finally {
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
+});
+
+// Caught in review: merging reads across roots (the previous test) isn't
+// enough on its own -- saveState() only ever wrote the new job list to the
+// current primary root, so a job that originated in a *different* root and
+// gets filtered out (e.g. cleanupSessionJobs() during SessionEnd, which
+// loads the merged view, drops jobs for the ending session, and saves the
+// remainder) never actually disappears: the other root's own state.json
+// still has its own untouched copy, and the next loadState() merges it
+// right back in. A "removed" job could keep reporting as running forever.
+test("saveState persists a job removal across every candidate root, not just the current primary", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+
+  try {
+    // Setup writes both roots directly (not via saveState()), exactly like
+    // the previous test -- a real caller always derives saveState()'s job
+    // list from a prior loadState() (see updateState()/cleanupSessionJobs()
+    // themselves), so seeding two roots via two independent, non-full-list
+    // saveState() calls wouldn't reflect any real call pattern and would
+    // trip the very deletion-propagation behavior under test here.
+    delete process.env.CLAUDE_PLUGIN_DATA;
+    writeStateFileDirectly(resolveStateDir(workspace), {
+      config: {},
+      jobs: [
+        { id: "job-fallback-keep", status: "running", updatedAt: "2026-08-19T00:00:00.000Z" },
+        { id: "job-fallback-remove", status: "running", updatedAt: "2026-08-19T00:00:00.000Z" }
+      ]
+    });
+
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+    writeStateFileDirectly(resolveStateDir(workspace), {
+      config: {},
+      jobs: [{ id: "job-plugin-data", status: "running", updatedAt: "2026-08-19T00:01:00.000Z" }]
+    });
+
+    // Mirrors cleanupSessionJobs(): load the merged view, drop one job that
+    // originated entirely in the fallback root, save the remainder -- still
+    // with CLAUDE_PLUGIN_DATA set, the same as a real SessionEnd hook.
+    const merged = loadState(workspace);
+    saveState(workspace, {
+      ...merged,
+      jobs: merged.jobs.filter((job) => job.id !== "job-fallback-remove")
+    });
+
+    const jobIdsAfterRemoval = loadState(workspace)
+      .jobs.map((job) => job.id)
+      .sort();
+
+    assert.deepEqual(jobIdsAfterRemoval, ["job-fallback-keep", "job-plugin-data"]);
+  } finally {
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
+});
+
+test("readStoredJob finds a job's detail file written without CLAUDE_PLUGIN_DATA when the current invocation has it set", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+
+  try {
+    delete process.env.CLAUDE_PLUGIN_DATA;
+    const jobFile = resolveJobFile(workspace, "job-1");
+    fs.writeFileSync(jobFile, JSON.stringify({ id: "job-1", status: "completed" }), "utf8");
+
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+    const job = readStoredJob(workspace, "job-1");
+
+    assert.deepEqual(job, { id: "job-1", status: "completed" });
+  } finally {
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
   }
 });
 
@@ -394,4 +592,131 @@ test("runTrackedJob stores no errorMessage for a completed execution", async () 
   assert.equal(storedJob.errorMessage, null);
   assert.equal(indexed.status, "completed");
   assert.equal(indexed.errorMessage, null);
+});
+
+
+test("the durable review-gate config is private", { skip: process.platform === "win32" }, () => {
+  const workspace = makeTempDir();
+  const codexHome = makeTempDir();
+  const previousCodexHome = process.env.CODEX_HOME;
+  try {
+    process.env.CODEX_HOME = codexHome;
+    setConfig(workspace, "stopReviewGate", true);
+
+    const configFile = resolveConfigFile(workspace);
+    // The gate decides whether Codex reviews every turn of this workspace, so
+    // it gets the same treatment as every other artifact this module writes:
+    // nobody else on the machine reads or rewrites it.
+    assert.equal(fs.statSync(configFile).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(path.dirname(configFile)).mode & 0o777, 0o700);
+  } finally {
+    if (previousCodexHome == null) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodexHome;
+  }
+});
+
+test("a durable config write that fails mid-write leaves the previous config intact", () => {
+  const workspace = makeTempDir();
+  const codexHome = makeTempDir();
+  const previousCodexHome = process.env.CODEX_HOME;
+  try {
+    process.env.CODEX_HOME = codexHome;
+    setConfig(workspace, "stopReviewGate", true);
+    const configFile = resolveConfigFile(workspace);
+    const before = fs.readFileSync(configFile, "utf8");
+
+    // Fails inside writeJsonFileAtomic(), after it has created its temporary
+    // file: the replacement is interrupted exactly where a crash or a full
+    // disk would interrupt it. The gate decides whether Codex reviews every
+    // turn, so a half-written file must never end up in its place -- that
+    // would read back as unset and silently disable the gate.
+    const explodingValue = {
+      toJSON() {
+        throw new Error("serialization failed mid-write");
+      }
+    };
+    assert.throws(() => setConfig(workspace, "stopReviewGate", explodingValue), /serialization failed mid-write/);
+
+    assert.equal(fs.readFileSync(configFile, "utf8"), before);
+    assert.equal(getConfig(workspace).stopReviewGate, true);
+    // The temporary file is cleaned up, so nothing is left to be mistaken for
+    // the real config.
+    assert.deepEqual(fs.readdirSync(path.dirname(configFile)), [path.basename(configFile)]);
+  } finally {
+    if (previousCodexHome == null) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodexHome;
+  }
+});
+
+
+function withRoots(fn) {
+  const previousPluginData = process.env.CLAUDE_PLUGIN_DATA;
+  const previousCodexHome = process.env.CODEX_HOME;
+  const workspace = makeTempDir();
+  const pluginData = makeTempDir();
+  const codexHome = makeTempDir();
+  process.env.CLAUDE_PLUGIN_DATA = pluginData;
+  process.env.CODEX_HOME = codexHome;
+  const primaryDir = resolveStateDir(workspace);
+  // The second candidate is the tmpdir fallback a CLI invocation without
+  // CLAUDE_PLUGIN_DATA resolves to.
+  const fallbackDir = path.join(os.tmpdir(), "codex-companion", path.basename(primaryDir));
+  fs.mkdirSync(fallbackDir, { recursive: true });
+  try {
+    return fn({ workspace, primaryDir, fallbackDir, codexHome });
+  } finally {
+    fs.rmSync(fallbackDir, { recursive: true, force: true });
+    if (previousPluginData == null) delete process.env.CLAUDE_PLUGIN_DATA;
+    else process.env.CLAUDE_PLUGIN_DATA = previousPluginData;
+    if (previousCodexHome == null) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodexHome;
+  }
+}
+
+test("pruning another state root waits for nobody and clobbers nobody", () => {
+  withRoots(({ workspace, fallbackDir }) => {
+    const fallbackState = path.join(fallbackDir, "state.json");
+    const foreignJob = { id: "task-foreign", status: "completed", updatedAt: "2026-01-01T00:00:00.000Z" };
+    fs.writeFileSync(
+      fallbackState,
+      `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [foreignJob] }, null, 2)}\n`,
+      "utf8"
+    );
+
+    // A process whose primary IS that root, mid-update.
+    const held = acquireLockSync(path.join(fallbackDir, ".state.lock"));
+    try {
+      saveState(workspace, { version: 1, config: { stopReviewGate: false }, jobs: [] });
+      // Rewriting it here would have thrown away whatever the lock holder is
+      // about to write.
+      const untouched = JSON.parse(fs.readFileSync(fallbackState, "utf8"));
+      assert.deepEqual(untouched.jobs, [foreignJob]);
+    } finally {
+      releaseLock(held);
+    }
+
+    // Once nobody holds it, the same prune goes through.
+    saveState(workspace, { version: 1, config: { stopReviewGate: false }, jobs: [] });
+    assert.deepEqual(JSON.parse(fs.readFileSync(fallbackState, "utf8")).jobs, []);
+  });
+});
+
+test("disabling the review gate is not outvoted by a stranded enable in another root", () => {
+  withRoots(({ workspace, fallbackDir, codexHome }) => {
+    setConfig(workspace, "stopReviewGate", true);
+    // A root that was written while CLAUDE_PLUGIN_DATA was unset.
+    fs.writeFileSync(
+      path.join(fallbackDir, "state.json"),
+      `${JSON.stringify({ version: 1, config: { stopReviewGate: true }, jobs: [] }, null, 2)}\n`,
+      "utf8"
+    );
+
+    setConfig(workspace, "stopReviewGate", false);
+
+    // With the durable config gone, getConfig() falls back to merging the
+    // roots, where booleans are ORed. A stranded true would outvote this
+    // disable forever unless the write reached that root too.
+    fs.rmSync(path.join(codexHome, "plugin-cc"), { recursive: true, force: true });
+    assert.equal(getConfig(workspace).stopReviewGate, false);
+  });
 });

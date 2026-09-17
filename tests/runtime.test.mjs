@@ -9,7 +9,7 @@ import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { loadState, resolveStateDir, saveState } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -889,9 +889,17 @@ test("session start hook exports the Claude session id, transcript path, and plu
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(
-    fs.readFileSync(envFile, "utf8"),
-    `export CODEX_COMPANION_SESSION_ID='sess-current'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='${transcriptPath}'\nexport CLAUDE_PLUGIN_DATA='${pluginDataDir}'\n`
+  // Each export opens with its own newline, so a line another plugin's hook
+  // appended without one cannot run into ours. Blank lines are nothing to the
+  // shell that sources this file, so the contract is the exports and their
+  // order, not byte-for-byte content.
+  assert.deepEqual(
+    fs.readFileSync(envFile, "utf8").split("\n").filter((line) => line !== ""),
+    [
+      "export CODEX_COMPANION_SESSION_ID='sess-current'",
+      `export CODEX_COMPANION_TRANSCRIPT_PATH='${transcriptPath}'`,
+      `export CLAUDE_PLUGIN_DATA='${pluginDataDir}'`
+    ]
   );
 });
 
@@ -5435,4 +5443,387 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   const payload = JSON.parse(setup.stdout);
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+});
+
+// Caught in review: cleanupSessionJobs() checked only resolveStateFile()'s
+// (the primary candidate's) existence before deciding whether to look for
+// jobs to clean up -- but loadState() is candidate-aware, so a session
+// whose jobs live only in the fallback root (e.g. started without
+// CLAUDE_PLUGIN_DATA, with SessionEnd later running with it set, flipping
+// which root is primary) would be silently skipped: the early check saw no
+// primary file and returned before loadState() was ever called.
+test("SessionEnd cleans up a session's jobs even when they exist only in the fallback root", () => {
+  const workspace = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
+
+  try {
+    delete process.env.CLAUDE_PLUGIN_DATA;
+    saveState(workspace, {
+      config: {},
+      jobs: [{ id: "job-fallback-only", sessionId: "sess-under-test", status: "completed", updatedAt: "2026-08-19T00:00:00.000Z" }]
+    });
+
+    const env = { ...process.env, CLAUDE_PLUGIN_DATA: pluginDataDir };
+    const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: workspace,
+      env,
+      input: JSON.stringify({
+        hook_event_name: "SessionEnd",
+        cwd: workspace,
+        session_id: "sess-under-test"
+      })
+    });
+    assert.equal(cleanup.status, 0, cleanup.stderr);
+
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+    const state = loadState(workspace);
+    assert.equal(
+      state.jobs.some((job) => job.id === "job-fallback-only"),
+      false
+    );
+  } finally {
+    if (previousPluginDataDir == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    }
+  }
+});
+
+test("task --resume-last ignores a stale current-session worker and resumes the prior completed thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-current" };
+  const first = run("node", [SCRIPT, "task", "initial task"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+  const statePath = path.join(resolveStateDir(repo), "state.json");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  state.jobs.push({ id: "task-stale", status: "running", title: "Codex Task", jobClass: "task", sessionId: "sess-current", pid: 999999, updatedAt: "2099-01-01T00:00:00.000Z" });
+  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  const resumed = run("node", [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.equal(resumed.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
+});
+
+test("task --resume-last blocks when a dead wrapper still has a live turn identity", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-current" };
+  const first = run("node", [SCRIPT, "task", "initial task"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+  const statePath = path.join(resolveStateDir(repo), "state.json");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  state.jobs.push({ id: "task-orphan-turn", status: "running", title: "Codex Task", jobClass: "task", sessionId: "sess-current", pid: 999999, threadId: "thr_orphan", turnId: "turn_orphan", updatedAt: "2099-01-01T00:00:00.000Z" });
+  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  const resumed = run("node", [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env });
+  assert.notEqual(resumed.status, 0);
+  assert.match(resumed.stderr, /task-orphan-turn is still running/i);
+});
+
+test("cancel fails closed when an orphaned turn has no persisted turn id", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify({
+    version: 1, config: { stopReviewGate: false }, jobs: [{
+      id: "task-turn-pending", status: "running", title: "Codex Task", jobClass: "task",
+      sessionId: "sess-current", pid: 999999, threadId: "thr_pending",
+      updatedAt: "2099-01-01T00:00:00.000Z"
+    }]
+  }, null, 2)}
+`, "utf8");
+  const env = { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-current" };
+  const result = run("node", [SCRIPT, "cancel", "task-turn-pending", "--json"], { cwd: workspace, env });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /turn id|safely interrupt|still running/i);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "running");
+});
+
+test("session end preserves an orphaned turn whose worker exited", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify({
+    version: 1, config: { stopReviewGate: false }, jobs: [{
+      id: "task-orphaned-turn", status: "running", title: "Codex Task", jobClass: "task",
+      sessionId: "sess-current", pid: 999999, threadId: "thr_pending",
+      updatedAt: "2099-01-01T00:00:00.000Z"
+    }]
+  }, null, 2)}
+`, "utf8");
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: workspace, env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-current" },
+    input: JSON.stringify({ hook_event_name: "SessionEnd", session_id: "sess-current", cwd: workspace })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs.length, 1);
+  assert.equal(state.jobs[0].id, "task-orphaned-turn");
+});
+
+test("stop hook ignores a stale current-session worker when the review gate is disabled", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [{ id: "task-stale", status: "running", title: "Codex Task", jobClass: "task", sessionId: "sess-current", pid: 999999, updatedAt: "2099-01-01T00:00:00.000Z" }] }, null, 2)}\n`, "utf8");
+  const result = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-current" },
+    input: JSON.stringify({ cwd: repo })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "");
+  assert.doesNotMatch(result.stderr, /task-stale is still running/i);
+});
+
+test("stop hook keeps an orphaned live turn active when its wrapper died", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [{ id: "task-orphan-turn", status: "running", title: "Codex Task", jobClass: "task", sessionId: "sess-current", pid: 999999, threadId: "thr_orphan", turnId: "turn_orphan", updatedAt: "2099-01-01T00:00:00.000Z" }] }, null, 2)}\n`, "utf8");
+  const result = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-current" },
+    input: JSON.stringify({ cwd: repo })
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "");
+  assert.match(result.stderr, /task-orphan-turn is still running/i);
+});
+
+
+test("a refused cancel leaves no terminal claim behind", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify({
+    version: 1, config: { stopReviewGate: false }, jobs: [{
+      id: "task-turn-pending", status: "running", title: "Codex Task", jobClass: "task",
+      sessionId: "sess-current", pid: 999999, threadId: "thr_pending",
+      updatedAt: "2099-01-01T00:00:00.000Z"
+    }]
+  }, null, 2)}\n`, "utf8");
+  const env = { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-current" };
+
+  const refused = run("node", [SCRIPT, "cancel", "task-turn-pending", "--json"], { cwd: workspace, env });
+  assert.equal(refused.status, 1);
+
+  // The terminal claim is never released, so a claim taken before the refusal
+  // would be adopted by the next cancel (or by SessionEnd) and reasserted into
+  // a cancelled record — for the turn this refusal exists to protect.
+  assert.equal(fs.existsSync(path.join(jobsDir, "task-turn-pending.terminal")), false);
+
+  const again = run("node", [SCRIPT, "cancel", "task-turn-pending", "--json"], { cwd: workspace, env });
+  assert.equal(again.status, 1);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "running");
+});
+
+test("task --resume-last still works with scoped read roots", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+
+  const first = run("node", [SCRIPT, "task", "--write", "--read-root", repo, "initial task"], { cwd: repo, env });
+  assert.equal(first.status, 0, first.stderr);
+
+  // A scoped run sends a permission profile and no sandbox mode, so the mode
+  // the app-server reports on resume is not the one this turn asked for.
+  // Asserting it refused every --read-root resume outright.
+  const resumed = run("node", [SCRIPT, "task", "--resume-last", "--write", "--read-root", repo, "follow up"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastThreadResume.sandbox, undefined);
+  assert.equal(fakeState.lastThreadResume.config.default_permissions, "claude_companion_scoped");
+});
+
+
+test("a retained orphaned turn stays reconcilable after session end", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  // The index carries the queued record's pid: null, while the job file has the
+  // real (now dead) pid and the thread the worker started. Session end must read
+  // the file, not the snapshot: on the snapshot alone there is no pid to judge,
+  // so the job would be recorded cancelled while its turn may still run.
+  fs.writeFileSync(path.join(jobsDir, "task-retained.json"), `${JSON.stringify({
+    id: "task-retained", status: "running", title: "Codex Task", jobClass: "task",
+    sessionId: "sess-current", pid: 999999, threadId: "thr_pending"
+  }, null, 2)}\n`, "utf8");
+  fs.writeFileSync(path.join(stateDir, "state.json"), `${JSON.stringify({
+    version: 1, config: { stopReviewGate: false }, jobs: [{
+      id: "task-retained", status: "running", title: "Codex Task", jobClass: "task",
+      sessionId: "sess-current", pid: null, threadId: null,
+      updatedAt: "2099-01-01T00:00:00.000Z"
+    }]
+  }, null, 2)}\n`, "utf8");
+
+  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: workspace,
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-current" },
+    input: JSON.stringify({ hook_event_name: "SessionEnd", session_id: "sess-current", cwd: workspace })
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  const retained = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs[0];
+  assert.equal(retained.status, "running");
+  assert.equal(retained.threadId, "thr_pending");
+  assert.equal(retained.phase, "worker-exited-turn-unknown");
+  // The verdict is persisted, not the dead pid: the record has to stay
+  // reconcilable without handing the dead-worker reaper something to fail.
+  assert.equal(retained.pid, null);
+  assert.equal(retained.workerExited, true);
+
+  // Another session ending must not reap it: its turn may still be running,
+  // and failing the record would also stop it pinning the shared broker.
+  const other = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: workspace,
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-other" },
+    input: JSON.stringify({ hook_event_name: "SessionEnd", session_id: "sess-other", cwd: workspace })
+  });
+  assert.equal(other.status, 0, other.stderr);
+  const afterOther = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs[0];
+  assert.equal(afterOther.status, "running");
+});
+
+
+test("the session start hook appends to CLAUDE_ENV_FILE without rewriting it", () => {
+  const repo = makeTempDir();
+  const envFile = path.join(makeTempDir(), "claude-env.sh");
+  const foreignExport = "export SOME_OTHER_PLUGIN_VAR='kept'\n";
+  fs.writeFileSync(envFile, foreignExport, "utf8");
+  fs.chmodSync(envFile, 0o600);
+  const pluginDataDir = makeTempDir();
+  const transcriptPath = path.join(repo, "session.jsonl");
+  const env = {
+    ...process.env,
+    CLAUDE_ENV_FILE: envFile,
+    CLAUDE_PLUGIN_DATA: pluginDataDir
+  };
+  const input = JSON.stringify({
+    hook_event_name: "SessionStart",
+    session_id: "sess-current",
+    transcript_path: transcriptPath,
+    cwd: repo
+  });
+
+  assert.equal(run("node", [SESSION_HOOK, "SessionStart"], { cwd: repo, env, input }).status, 0);
+  assert.equal(run("node", [SESSION_HOOK, "SessionStart"], { cwd: repo, env, input }).status, 0);
+
+  const contents = fs.readFileSync(envFile, "utf8");
+  // The file is shared with every other plugin's SessionStart hook: a rewrite
+  // would drop whatever another hook appended, and replacing the file discards
+  // its mode with it.
+  assert.match(contents, /export SOME_OTHER_PLUGIN_VAR='kept'/);
+  assert.equal(fs.statSync(envFile).mode & 0o777, 0o600);
+  // Re-exporting the same value must not grow the file either.
+  assert.equal(contents.split("\n").filter((line) => line.startsWith("export CODEX_COMPANION_SESSION_ID=")).length, 1);
+
+  // A changed value is appended; the shell takes the last export for a key.
+  assert.equal(
+    run("node", [SESSION_HOOK, "SessionStart"], {
+      cwd: repo,
+      env,
+      input: JSON.stringify({
+        hook_event_name: "SessionStart",
+        session_id: "sess-next",
+        transcript_path: transcriptPath,
+        cwd: repo
+      })
+    }).status,
+    0
+  );
+  const sessionExports = fs
+    .readFileSync(envFile, "utf8")
+    .split("\n")
+    .filter((line) => line.startsWith("export CODEX_COMPANION_SESSION_ID="));
+  assert.equal(sessionExports.at(-1), "export CODEX_COMPANION_SESSION_ID='sess-next'");
+});
+
+
+function seedRetainedOrphan(workspace, updatedAt) {
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({
+      version: 1,
+      config: { stopReviewGate: false },
+      jobs: [{
+        id: "task-orphan", status: "running", title: "Codex Task", jobClass: "task",
+        sessionId: "sess-owner", pid: null, threadId: "thr_pending", workerExited: true, updatedAt
+      }]
+    }, null, 2)}\n`,
+    "utf8"
+  );
+  return stateDir;
+}
+
+function endSessionFor(workspace, env) {
+  return run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: workspace,
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-other", ...env },
+    input: JSON.stringify({ hook_event_name: "SessionEnd", session_id: "sess-other", cwd: workspace })
+  });
+}
+
+test("a retained orphan expires even when the broker idle timer is disabled", () => {
+  const workspace = makeTempDir();
+  const hoursAgo = (hours) => new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+
+  // Two hours old, idle shutdown off: still protected — nothing has proved the
+  // turn is over.
+  let stateDir = seedRetainedOrphan(workspace, hoursAgo(2));
+  assert.equal(endSessionFor(workspace, { CODEX_BROKER_IDLE_SHUTDOWN_MS: "0" }).status, 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs[0].status, "running");
+
+  // Past the generic staleness bound, still with the idle timer off: reaped,
+  // rather than pinning the broker for good.
+  stateDir = seedRetainedOrphan(workspace, hoursAgo(25));
+  assert.equal(endSessionFor(workspace, { CODEX_BROKER_IDLE_SHUTDOWN_MS: "0" }).status, 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs[0].status, "failed");
+
+  // With the timer at ten minutes, the same two-hour-old record is over.
+  stateDir = seedRetainedOrphan(workspace, hoursAgo(2));
+  assert.equal(endSessionFor(workspace, { CODEX_BROKER_IDLE_SHUTDOWN_MS: "600000" }).status, 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs[0].status, "failed");
+});
+
+test("a retained orphan with an unreadable timestamp does not pin the broker forever", () => {
+  const workspace = makeTempDir();
+  const stateDir = seedRetainedOrphan(workspace, "not-a-timestamp");
+
+  assert.equal(endSessionFor(workspace, {}).status, 0);
+
+  // This is the one record that stops a teardown, so an unreadable timestamp
+  // has to count as expired: "cannot tell" must not mean "protected forever".
+  assert.equal(JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs[0].status, "failed");
 });

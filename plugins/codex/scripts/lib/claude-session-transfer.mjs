@@ -156,25 +156,43 @@ function acquireStagingLease(stagedPath, staged) {
     } else {
       managed = markerMatches;
     }
-    if (managed) fs.writeFileSync(leasePath, "", { flag: "wx" });
+    // The lease is taken whatever `managed` says. A process that attaches to a
+    // staged copy the creator has not yet marked would otherwise hold no lease,
+    // and the creator's release() -- seeing no leases -- deletes the file out
+    // from under it. `managed` only decides whether we may write the marker.
+    fs.writeFileSync(leasePath, "", { flag: "wx" });
   });
 
   return {
     release() {
-      if (!managed) return;
-      withStagingLock(stagedPath, () => {
+      // Called from a finally: a staging lock that is busy (5s) or unusable
+      // must never surface in place of the import error that is unwinding.
+      // Dropping our own lease needs no lock — the path is unique to us — so
+      // the fallback still frees the staged copy for whoever leaves last.
+      try {
+        releaseLocked();
+      } catch {
+        try { fs.unlinkSync(leasePath); } catch (error) { if (error?.code !== "ENOENT") { /* nothing left to do */ } }
+      }
+    }
+  };
+
+  function releaseLocked() {
+    withStagingLock(stagedPath, () => {
         try { fs.unlinkSync(leasePath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
         const activeLeases = fs.readdirSync(directory).filter((name) => name.startsWith(leasePrefix));
+        // Cleanup belongs to whoever leaves last, not to whoever created the
+        // copy: the marker is what proves the staging is the plugin's, and the
+        // lease count is what proves nobody is still reading it.
         if (activeLeases.length > 0 || !managedMarkerMatches(markerPath)) return;
         if (fs.existsSync(stagedPath) && fileSha256(stagedPath) !== staged.sourceSha256) {
           fs.unlinkSync(markerPath);
           return;
         }
         try { fs.unlinkSync(stagedPath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
-        try { fs.unlinkSync(markerPath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
-      });
-    }
-  };
+      try { fs.unlinkSync(markerPath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+    });
+  }
 }
 
 function isWithin(root, candidate) {
