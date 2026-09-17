@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir } from "./helpers.mjs";
 import {
+  getConfig,
   listJobs,
   resolveJobFile,
   resolveJobLogFile,
@@ -16,6 +17,7 @@ import {
   resolveStateDir,
   resolveStateFile,
   saveState,
+  setConfig,
   writeJobFile
 } from "../plugins/codex/scripts/lib/state.mjs";
 import { createJobLogFile, runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
@@ -68,6 +70,28 @@ test("state, job, and log artifacts are private", { skip: process.platform === "
   assert.equal(fs.statSync(resolveStateFile(workspace)).mode & 0o777, 0o600);
   assert.equal(fs.statSync(jobFile).mode & 0o777, 0o600);
   assert.equal(fs.statSync(logFile).mode & 0o777, 0o600);
+});
+
+test("review-gate config remains authoritative when CLAUDE_PLUGIN_DATA changes", () => {
+  const workspace = makeTempDir();
+  const codexHome = makeTempDir();
+  const pluginDataA = makeTempDir();
+  const pluginDataB = makeTempDir();
+  const previousCodexHome = process.env.CODEX_HOME;
+  const previousPluginData = process.env.CLAUDE_PLUGIN_DATA;
+  try {
+    process.env.CODEX_HOME = codexHome;
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataA;
+    setConfig(workspace, "stopReviewGate", true);
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataB;
+    assert.equal(getConfig(workspace).stopReviewGate, true);
+    setConfig(workspace, "stopReviewGate", false);
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataA;
+    assert.equal(getConfig(workspace).stopReviewGate, false);
+  } finally {
+    if (previousCodexHome == null) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previousCodexHome;
+    if (previousPluginData == null) delete process.env.CLAUDE_PLUGIN_DATA; else process.env.CLAUDE_PLUGIN_DATA = previousPluginData;
+  }
 });
 
 test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", () => {
