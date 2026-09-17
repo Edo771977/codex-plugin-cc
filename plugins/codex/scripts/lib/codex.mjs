@@ -124,14 +124,19 @@ function sandboxModeForPolicy(policy) {
 // take back what a thread started with `danger-full-access` already has: the
 // sandbox is off for that thread, so the scope would be a promise this plugin
 // cannot keep.
-function assertScopedResumeNotEscalated(threadId, response) {
+function assertScopedNotEscalated(threadId, response, { resumed }) {
   const effectiveMode = sandboxModeForPolicy(response?.sandbox);
   if (effectiveMode !== "danger-full-access") {
     return;
   }
   throw new Error(
     `Thread ${threadId} runs with the Codex sandbox disabled (danger-full-access), so --read-root cannot scope it. ` +
-      "Start a fresh thread with --fresh to run scoped."
+      (resumed
+        ? "Start a fresh thread with --fresh to run scoped."
+        : // A fresh thread is what just started, so "--fresh" would only repeat
+          // this. The mode came from the Codex config that applies here.
+          "It was started that way by the Codex config in effect (sandbox_mode in config.toml), " +
+          "so drop --read-root or change that default to run scoped.")
   );
 }
 
@@ -1358,7 +1363,7 @@ export async function runAppServerTurn(cwd, options = {}) {
         // The escalation half of that check still applies, though — a thread
         // started with the sandbox disabled is not scoped by any profile.
         if (options.readRoots?.length > 0) {
-          assertScopedResumeNotEscalated(options.resumeThreadId, response);
+          assertScopedNotEscalated(options.resumeThreadId, response, { resumed: true });
         } else {
           assertResumedSandbox(options.resumeThreadId, options.sandbox, response);
         }
@@ -1377,7 +1382,7 @@ export async function runAppServerTurn(cwd, options = {}) {
         // which case the scope this run asked for would not hold here either —
         // and "start a fresh thread" is the advice the resume path gives.
         if (options.readRoots?.length > 0) {
-          assertScopedResumeNotEscalated(response.thread.id, response);
+          assertScopedNotEscalated(response.thread.id, response, { resumed: false });
         }
         threadId = response.thread.id;
       }

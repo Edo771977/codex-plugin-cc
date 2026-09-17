@@ -261,7 +261,7 @@ function pruneOtherStateRoot(otherStateDir, retainedIds, knownIds) {
   }
 }
 
-function saveStateLocked(cwd, state) {
+function saveStateLocked(cwd, state, options = {}) {
   const previousJobs = loadState(cwd).jobs;
   const nextJobs = pruneJobs(state.jobs ?? []);
   const nextState = {
@@ -297,10 +297,12 @@ function saveStateLocked(cwd, state) {
   // only in a non-primary root. Prune every other candidate root down to the same
   // retained set; new and updated jobs are still only ever written to the primary
   // root, above. This only ever removes.
-  // Ids the caller actually decided about: whatever the merged snapshot at the
-  // top of this function held. Anything else in another root arrived after it
-  // and is nobody's to drop here.
-  const knownIds = new Set(previousJobs.map((job) => job.id));
+  // Ids the caller actually decided about. updateState() hands down the snapshot
+  // it mutated, which closes the window between its read and the re-read above;
+  // a direct saveState() has no such snapshot to offer, so the re-read is the
+  // best available. Anything in another root outside this set arrived after the
+  // caller looked and is nobody's to drop here.
+  const knownIds = options.knownIds ?? new Set(previousJobs.map((job) => job.id));
   const [, ...otherStateDirs] = resolveStateDirCandidates(cwd);
   for (const otherStateDir of otherStateDirs) {
     pruneOtherStateRoot(otherStateDir, retainedIds, knownIds);
@@ -318,8 +320,9 @@ export function updateState(cwd, mutate) {
   ensureStateDir(cwd);
   return withLockSync(resolveStateLockDir(cwd), () => {
     const state = loadState(cwd);
+    const knownIds = new Set(state.jobs.map((job) => job.id));
     mutate(state);
-    return saveStateLocked(cwd, state);
+    return saveStateLocked(cwd, state, { knownIds });
   });
 }
 

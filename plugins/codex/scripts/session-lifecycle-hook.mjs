@@ -142,15 +142,20 @@ function retainedOrphanExpired(job, env = process.env) {
   if (job?.workerExited !== true) {
     return false;
   }
+  // Unlike every other record, this one is why SessionEnd declines to tear the
+  // broker down, so "cannot tell" must not mean "protected forever": a record
+  // with no readable timestamp has already outlived anything it could protect.
   const reference = job.updatedAt ?? job.createdAt ?? null;
   const timestamp = reference ? Date.parse(reference) : Number.NaN;
   if (!Number.isFinite(timestamp)) {
-    return false;
+    return true;
   }
-  const windowMs = brokerIdleShutdownMs(env);
-  if (!Number.isFinite(windowMs) || windowMs <= 0) {
-    return false;
-  }
+  // The broker's idle timer is what actually ends the turn, so it sets the
+  // window. With that timer disabled (CODEX_BROKER_IDLE_SHUTDOWN_MS=0) nothing
+  // would end it, so fall back to the generic staleness bound rather than
+  // pinning the broker — and its app-server and MCP servers — indefinitely.
+  const idleMs = brokerIdleShutdownMs(env);
+  const windowMs = Number.isFinite(idleMs) && idleMs > 0 ? idleMs : ACTIVE_JOB_STALENESS_MS;
   return Date.now() - timestamp > windowMs;
 }
 
