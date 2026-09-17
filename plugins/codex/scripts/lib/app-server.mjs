@@ -70,6 +70,12 @@ class AppServerClientBase {
     this.notificationHandler = null;
     this.lineBuffer = "";
     this.transport = "unknown";
+    // Only the spawned transport owns a child process; the broker transport
+    // talks to one it does not own. Declaring it here keeps the shared cleanup
+    // paths honest about the union instead of reaching for a property half the
+    // clients never have.
+    /** @type {import("node:child_process").ChildProcess | null} */
+    this.proc = null;
 
     this.exitPromise = new Promise((resolve) => {
       this.resolveExit = resolve;

@@ -1,9 +1,12 @@
 export function parseArgs(argv, config = {}) {
   const valueOptions = new Set(config.valueOptions ?? []);
+  const multiValueOptions = new Set(config.multiValueOptions ?? []);
   const booleanOptions = new Set(config.booleanOptions ?? []);
   const aliasMap = config.aliasMap ?? {};
+  const leadingOnlyOptions = new Set(config.leadingOnlyOptions ?? []);
   const options = {};
   const positionals = [];
+  const unknownOptions = [];
   let passthrough = false;
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -25,26 +28,42 @@ export function parseArgs(argv, config = {}) {
     }
 
     if (token.startsWith("--")) {
-      const [rawKey, inlineValue] = token.slice(2).split("=", 2);
+      const body = token.slice(2);
+      const separator = body.indexOf("=");
+      const rawKey = separator === -1 ? body : body.slice(0, separator);
+      const inlineValue = separator === -1 ? undefined : body.slice(separator + 1);
       const key = aliasMap[rawKey] ?? rawKey;
 
-      if (booleanOptions.has(key)) {
-        options[key] = inlineValue === undefined ? true : inlineValue !== "false";
+      if (leadingOnlyOptions.has(key) && positionals.length > 0) {
+        positionals.push(token);
         continue;
       }
 
-      if (valueOptions.has(key)) {
+      if (booleanOptions.has(key)) {
+        if (inlineValue !== undefined && inlineValue !== "true" && inlineValue !== "false") {
+          throw new Error(`Invalid value for --${rawKey}: expected true or false`);
+        }
+        options[key] = inlineValue !== "false";
+        continue;
+      }
+
+      if (valueOptions.has(key) || multiValueOptions.has(key)) {
         const nextValue = inlineValue ?? argv[index + 1];
         if (nextValue === undefined) {
           throw new Error(`Missing value for --${rawKey}`);
         }
-        options[key] = nextValue;
+        if (multiValueOptions.has(key)) {
+          options[key] = [...(options[key] ?? []), nextValue];
+        } else {
+          options[key] = nextValue;
+        }
         if (inlineValue === undefined) {
           index += 1;
         }
         continue;
       }
 
+      unknownOptions.push(token);
       positionals.push(token);
       continue;
     }
@@ -57,12 +76,16 @@ export function parseArgs(argv, config = {}) {
       continue;
     }
 
-    if (valueOptions.has(key)) {
+    if (valueOptions.has(key) || multiValueOptions.has(key)) {
       const nextValue = argv[index + 1];
       if (nextValue === undefined) {
         throw new Error(`Missing value for -${shortKey}`);
       }
-      options[key] = nextValue;
+      if (multiValueOptions.has(key)) {
+        options[key] = [...(options[key] ?? []), nextValue];
+      } else {
+        options[key] = nextValue;
+      }
       index += 1;
       continue;
     }
@@ -70,7 +93,7 @@ export function parseArgs(argv, config = {}) {
     positionals.push(token);
   }
 
-  return { options, positionals };
+  return { options, positionals, unknownOptions };
 }
 
 export function splitRawArgumentString(raw) {

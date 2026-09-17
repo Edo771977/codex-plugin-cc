@@ -21,7 +21,7 @@ import {
     runAppServerReview,
     runAppServerTurn
   } from "./lib/codex.mjs";
-import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
+import { prepareClaudeSessionImport, resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { armTimeout, disarmTimeout, workerTtlMs } from "./lib/lifecycle-limits.mjs";
@@ -76,6 +76,7 @@ const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const CANCEL_TURN_INTERRUPT_TIMEOUT_MS = 5000;
 const CANCEL_TURN_IDENTITY_WAIT_MS = 3000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+const VALID_SANDBOX_MODES = new Set(["read-only", "workspace-write", "danger-full-access"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
@@ -85,8 +86,8 @@ function printUsage() {
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [focus text]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--sandbox <read-only|workspace-write|danger-full-access>] [--read-root <directory> ...] [--resume-last|--resume|--resume-thread <id>|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -134,6 +135,26 @@ function normalizeReasoningEffort(effort) {
   return normalized;
 }
 
+function normalizeSandboxMode(sandbox) {
+  if (sandbox === undefined) {
+    return null;
+  }
+  const normalized = String(sandbox).trim().toLowerCase();
+  if (!normalized) {
+    throw new Error("Missing value for --sandbox. Use one of: read-only, workspace-write, danger-full-access.");
+  }
+  if (!VALID_SANDBOX_MODES.has(normalized)) {
+    throw new Error(
+      `Unsupported sandbox mode "${sandbox}". Use one of: read-only, workspace-write, danger-full-access.`
+    );
+  }
+  return normalized;
+}
+
+function defaultTaskSandbox(write) {
+  return write ? "workspace-write" : "read-only";
+}
+
 function normalizeArgv(argv) {
   if (argv.length === 1) {
     const [raw] = argv;
@@ -146,13 +167,25 @@ function normalizeArgv(argv) {
 }
 
 function parseCommandInput(argv, config = {}) {
-  return parseArgs(normalizeArgv(argv), {
+  const parsed = parseArgs(normalizeArgv(argv), {
     ...config,
     aliasMap: {
       C: "cwd",
       ...(config.aliasMap ?? {})
     }
   });
+
+  // An unrecognised long option is still treated as a positional, because some
+  // commands take free-form text. Say so on stderr rather than swallowing it:
+  // a mistyped or unsupported flag would otherwise be silently folded into a
+  // prompt, and the run would look like it did what was asked.
+  for (const token of parsed.unknownOptions ?? []) {
+    console.warn(
+      `Warning: unrecognised option ${token}; treating it as text. It will be passed through verbatim, not interpreted as a flag.`
+    );
+  }
+
+  return parsed;
 }
 
 function resolveCommandCwd(options = {}) {
@@ -161,6 +194,22 @@ function resolveCommandCwd(options = {}) {
 
 function resolveCommandWorkspace(options = {}) {
   return resolveWorkspaceRoot(resolveCommandCwd(options));
+}
+
+function resolveReadRoot(cwd, readRoot) {
+  if (typeof readRoot !== "string" || !readRoot.trim()) {
+    throw new Error("--read-root must name an existing directory: value is empty");
+  }
+  const resolved = path.resolve(cwd, readRoot);
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+    throw new Error(`--read-root must name an existing directory: ${readRoot}`);
+  }
+  return fs.realpathSync(resolved);
+}
+
+function pathCovers(parent, child) {
+  const relative = path.relative(parent, child);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== "..");
 }
 
 function sleep(ms) {
@@ -406,7 +455,8 @@ async function executeReviewRun(request) {
       turnId: result.turnId,
       payload,
       rendered,
-      summary: firstMeaningfulLine(result.reviewText, `${reviewName} completed.`),
+      summary: shorten(firstMeaningfulLine(result.reviewText, `${reviewName} completed.`), 96),
+      errorMessage: result.error?.message ?? result.stderr ?? null,
       jobTitle: `Codex ${reviewName}`,
       jobClass: "review",
       targetLabel: target.label
@@ -418,6 +468,7 @@ async function executeReviewRun(request) {
   const result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
+    effort: request.effort,
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
     onProgress: request.onProgress
@@ -426,6 +477,7 @@ async function executeReviewRun(request) {
     status: result.status,
     failureMessage: result.error?.message ?? result.stderr
   });
+  const failureMessage = result.error?.message ?? result.stderr ?? parsed.parseError ?? "";
   const payload = {
     review: reviewName,
     target,
@@ -457,7 +509,8 @@ async function executeReviewRun(request) {
       targetLabel: context.target.label,
       reasoningSummary: result.reasoningSummary
     }),
-    summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
+    summary: parsed.parsed?.summary ?? shorten(firstMeaningfulLine(failureMessage || result.finalMessage, `${reviewName} finished.`), 96),
+    errorMessage: failureMessage || null,
     jobTitle: `Codex ${reviewName}`,
     jobClass: "review",
     targetLabel: context.target.label
@@ -471,11 +524,13 @@ async function executeTaskRun(request) {
 
   const taskMetadata = buildTaskRunMetadata({
     prompt: request.prompt,
-    resumeLast: request.resumeLast
+    resumeLast: request.resumeLast || Boolean(request.resumeThread)
   });
 
   let resumeThreadId = null;
-  if (request.resumeLast) {
+  if (request.resumeThread) {
+    resumeThreadId = request.resumeThread;
+  } else if (request.resumeLast) {
     const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
       excludeJobId: request.jobId
     });
@@ -486,7 +541,7 @@ async function executeTaskRun(request) {
   }
 
   if (!request.prompt && !resumeThreadId) {
-    throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
+    throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last / --resume-thread <id>.");
   }
 
   const result = await runAppServerTurn(workspaceRoot, {
@@ -495,7 +550,9 @@ async function executeTaskRun(request) {
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
-    sandbox: request.write ? "workspace-write" : "read-only",
+    sandbox: request.sandbox ?? defaultTaskSandbox(Boolean(request.write)),
+    readRoots: request.readRoots,
+    write: request.write,
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
@@ -522,6 +579,10 @@ async function executeTaskRun(request) {
     touchedFiles: result.touchedFiles,
     reasoningSummary: result.reasoningSummary
   };
+  const summary = shorten(
+    firstMeaningfulLine(failureMessage || rawOutput, `${taskMetadata.title} finished.`),
+    96
+  );
 
   return {
     exitStatus: result.status,
@@ -529,7 +590,8 @@ async function executeTaskRun(request) {
     turnId: result.turnId,
     payload,
     rendered,
-    summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
+    summary,
+    errorMessage: failureMessage || null,
     jobTitle: taskMetadata.title,
     jobClass: "task",
     write: Boolean(request.write)
@@ -608,14 +670,17 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, sandbox, readRoots, resumeLast, resumeThread = null, jobId }) {
   return {
     cwd,
     model,
     effort,
     prompt,
     write,
+    sandbox,
+    readRoots,
     resumeLast,
+    resumeThread,
     jobId
   };
 }
@@ -633,7 +698,13 @@ async function executeTransfer(cwd, options = {}) {
   const sourcePath = resolveClaudeSessionPath(cwd, {
     source: options.source
   });
-  const result = await importExternalAgentSession(cwd, { sourcePath });
+  const prepared = prepareClaudeSessionImport(cwd, sourcePath);
+  let result;
+  try {
+    result = await importExternalAgentSession(cwd, { sourcePath: prepared.importPath });
+  } finally {
+    prepared.cleanup();
+  }
   const payload = {
     threadId: result.threadId,
     resumeCommand: `codex resume ${result.threadId}`,
@@ -656,9 +727,9 @@ function readTaskPrompt(cwd, options, positionals) {
   return positionalPrompt || readStdinIfPiped();
 }
 
-function requireTaskRequest(prompt, resumeLast) {
-  if (!prompt && !resumeLast) {
-    throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
+function requireTaskRequest(prompt, resumeLast, resumeThread = null) {
+  if (!prompt && !resumeLast && !resumeThread) {
+    throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last / --resume-thread <id>.");
   }
 }
 
@@ -751,7 +822,7 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "effort", "cwd"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -760,6 +831,7 @@ async function handleReviewCommand(argv, config) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
+  const effort = normalizeReasoningEffort(options.effort);
   const focusText = positionals.join(" ").trim();
   const target = resolveReviewTarget(cwd, {
     base: options.base,
@@ -784,6 +856,7 @@ async function handleReviewCommand(argv, config) {
         base: options.base,
         scope: options.scope,
         model: options.model,
+        effort,
         focusText,
         reviewName: config.reviewName,
         onProgress: progress
@@ -801,8 +874,10 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "sandbox", "resume-thread"],
+    multiValueOptions: ["read-root"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    leadingOnlyOptions: ["sandbox"],
     aliasMap: {
       m: "model"
     }
@@ -815,19 +890,36 @@ async function handleTask(argv) {
   const prompt = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
+  const resumeThreadOption = options["resume-thread"];
+  const resumeThread = resumeThreadOption === undefined ? null : String(resumeThreadOption).trim();
   const fresh = Boolean(options.fresh);
-  if (resumeLast && fresh) {
-    throw new Error("Choose either --resume/--resume-last or --fresh.");
+  if (resumeThreadOption !== undefined && !resumeThread) {
+    throw new Error("--resume-thread requires a non-empty thread id.");
   }
-  const write = Boolean(options.write);
+  if (Number(resumeLast) + Number(Boolean(resumeThread)) + Number(fresh) > 1) {
+    throw new Error("Choose only one of --resume/--resume-last, --resume-thread <id>, or --fresh.");
+  }
+  const sandbox = normalizeSandboxMode(options.sandbox) ?? defaultTaskSandbox(Boolean(options.write));
+  const write = sandbox !== "read-only";
+  const readRoots = (options["read-root"] ?? []).map((readRoot) => resolveReadRoot(cwd, readRoot));
+  if (readRoots.length > 0 && sandbox === "danger-full-access") {
+    throw new Error(
+      "--read-root cannot be combined with --sandbox danger-full-access: that mode disables the Codex sandbox, so no read scope is enforced."
+    );
+  }
+  if (write && readRoots.length > 0 && !readRoots.some((readRoot) => pathCovers(readRoot, workspaceRoot))) {
+    throw new Error(
+      "--write requires an approved --read-root that covers the workspace directory; the same applies to --sandbox workspace-write."
+    );
+  }
   const taskMetadata = buildTaskRunMetadata({
     prompt,
-    resumeLast
+    resumeLast: resumeLast || Boolean(resumeThread)
   });
 
   if (options.background) {
     ensureCodexAvailable(cwd);
-    requireTaskRequest(prompt, resumeLast);
+    requireTaskRequest(prompt, resumeLast, resumeThread);
 
     const job = buildTaskJob(workspaceRoot, taskMetadata, write);
     const request = buildTaskRequest({
@@ -836,7 +928,10 @@ async function handleTask(argv) {
       effort,
       prompt,
       write,
+      sandbox,
+      readRoots,
       resumeLast,
+      resumeThread,
       jobId: job.id
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
@@ -854,7 +949,10 @@ async function handleTask(argv) {
         effort,
         prompt,
         write,
+        sandbox,
+        readRoots,
         resumeLast,
+        resumeThread,
         jobId: job.id,
         onProgress: progress
       }),

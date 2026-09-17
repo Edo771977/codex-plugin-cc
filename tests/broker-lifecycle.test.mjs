@@ -121,21 +121,38 @@ test("broker rejects a shutdown token that does not identify its instance", asyn
   assert.ok(loadBrokerSession(workspace));
 });
 
-test("shutdown closes idle half-open broker clients", { skip: process.platform === "win32" }, async (t) => {
+test("shutdown closes a lingering half-open peer requester", { skip: process.platform === "win32" }, async (t) => {
   const workspace = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
   const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir) });
-  const idleClient = net.createConnection({
+
+  // A racing session-end hook that has already sent its own broker/shutdown is
+  // a peer requester, not work, so the busy check must skip it. It keeps its
+  // read side open (allowHalfOpen), which means end() alone would leave
+  // server.close() pending on it: only an explicit destroy lets the broker go.
+  const peer = net.createConnection({
     path: session.endpoint.slice("unix:".length),
     allowHalfOpen: true
   });
-  idleClient.on("end", () => {});
+  peer.setEncoding("utf8");
+  t.after(() => peer.destroy());
   await new Promise((resolve, reject) => {
-    idleClient.once("connect", resolve);
-    idleClient.once("error", reject);
+    peer.once("connect", resolve);
+    peer.once("error", reject);
   });
-  t.after(() => idleClient.destroy());
+  const refusal = new Promise((resolve) => peer.once("data", resolve));
+  peer.write(
+    `${JSON.stringify({ id: 1, method: "broker/shutdown", params: { instanceToken: "not-this-instance" } })}\n`
+  );
+  assert.match(await refusal, /identity did not match/i);
+  // allowHalfOpen means the client never closes itself: it only learns the
+  // broker let go when the read side ends (or the socket dies outright).
+  const peerReleased = new Promise((resolve) => {
+    peer.once("end", resolve);
+    peer.once("close", resolve);
+    peer.once("error", resolve);
+  });
 
   const outcome = await shutdownBrokerSession(workspace, {
     timeoutMs: 500,
@@ -145,6 +162,50 @@ test("shutdown closes idle half-open broker clients", { skip: process.platform =
 
   assert.equal(outcome.exited, true);
   assert.equal(outcome.forced, false);
+  assert.equal(loadBrokerSession(workspace), null);
+  // Released by the broker rather than waited on: this resolving at all is the
+  // assertion — a shutdown that waited on a half-open peer would hang here.
+  await peerReleased;
+});
+
+test("a busy broker refuses shutdown instead of failing it", { skip: process.platform === "win32" }, async (t) => {
+  const workspace = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const session = await ensureBrokerSession(workspace, { env: buildEnv(binDir) });
+
+  // An ordinary connected client — a worker that has not sent its first
+  // request yet — is exactly what the busy check protects: it must keep the
+  // broker alive, without turning session end into an error.
+  const client = net.createConnection({ path: session.endpoint.slice("unix:".length) });
+  t.after(() => client.destroy());
+  await new Promise((resolve, reject) => {
+    client.once("connect", resolve);
+    client.once("error", reject);
+  });
+
+  const refused = await shutdownBrokerSession(workspace, {
+    timeoutMs: 500,
+    intervalMs: 10,
+    killProcess: terminateProcessTree
+  });
+
+  assert.equal(refused.refused, true);
+  assert.equal(refused.exited, false);
+  assert.equal(refused.forced, false);
+  assert.ok(loadBrokerSession(workspace), "a refused shutdown must preserve the persisted record");
+  assert.equal(isProcessTreeRunning(session.pid), true);
+
+  // Once the client is gone the very same call retires the broker.
+  client.destroy();
+  await new Promise((resolve) => client.once("close", resolve));
+  const retired = await shutdownBrokerSession(workspace, {
+    timeoutMs: 2000,
+    intervalMs: 10,
+    killProcess: terminateProcessTree
+  });
+  assert.equal(retired.refused, false);
+  assert.equal(retired.exited, true);
   assert.equal(loadBrokerSession(workspace), null);
 });
 
@@ -173,7 +234,16 @@ test("shutdown request always uses a finite deadline", { skip: process.platform 
       instanceToken: "instance-token-1234567890",
       timeoutMs
     });
-    assert.equal(response, null);
+    // A broker that accepts the connection and then says nothing is ambiguous:
+    // it may be alive and busy with its refusal lost on the wire. The outcome
+    // has to report that — not delivered, not refused, and deliberately not
+    // unreachable — so teardown never reaps a broker that may still be serving
+    // someone.
+    assert.equal(response.delivered, false);
+    assert.equal(response.refused, false);
+    assert.equal(response.unreachable, false);
+    assert.equal(response.result, null);
+    assert.equal(response.error, null);
     assert.ok(Date.now() - startedAt < 500, "shutdown request exceeded its deadline");
   }
   assert.equal(fs.existsSync(socketPath), true);
@@ -1021,7 +1091,13 @@ test("shutdown reclaims a tokened session whose dead leader left an orphaned gro
     const outcome = await shutdownBrokerSession(workspace, { timeoutMs: 40, killProcess });
 
     assert.equal(killProcessCalled, false, "an abandoned orphaned tree must never be signaled");
-    assert.deepEqual(outcome, { found: true, exited: true, forced: false, reclaimedStaleEndpoint: true });
+    assert.deepEqual(outcome, {
+      found: true,
+      exited: true,
+      forced: false,
+      refused: false,
+      reclaimedStaleEndpoint: true
+    });
     assert.equal(isProcessRunning(grandchildPid), true, "the grandchild must be left running untouched");
     assert.equal(fs.existsSync(socketPath), false, "the stale socket must be removed");
     assert.equal(fs.existsSync(pidFile), false, "the pid file must be removed");

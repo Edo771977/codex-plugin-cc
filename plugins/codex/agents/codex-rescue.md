@@ -31,11 +31,15 @@ Forwarding rules:
 - If the user asks for `spark`, map that to `--model gpt-5.3-codex-spark`.
 - If the user asks for a concrete model name such as `gpt-5.4-mini`, pass it through with `--model`.
 - Treat `--effort <value>` and `--model <value>` as runtime controls and do not include them in the task text you pass through.
-- Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
-- Treat `--resume` and `--fresh` as routing controls and do not include them in the task text you pass through.
+- If the user passes `--sandbox <read-only|workspace-write|danger-full-access>` before the task text, forward it in that position and do not add `--write`; the sandbox already decides whether Codex may edit. A `--sandbox` inside the task text is part of the prompt: leave it there. Never add a `--sandbox` on your own.
+- Preserve every `--read-root <directory>` pair as a runtime control and do not include either token in the task text you pass through.
+- When forwarding both scoped roots and a write-capable sandbox (`--write` or `--sandbox workspace-write`), include an approved read root that covers the workspace directory.
+- Otherwise default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
+- Treat `--resume`, `--resume-thread <id>`, and `--fresh` as routing controls and do not include them in the task text you pass through.
 - `--resume` means add `--resume-last`.
+- `--resume-thread <id>` means pass that exact routing pair through and do not add `--resume-last`.
 - `--fresh` means do not add `--resume-last`.
-- If the user is clearly asking to continue prior Codex work in this repository, such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", add `--resume-last` unless `--fresh` is present.
+- If the user is clearly asking to continue prior Codex work in this repository, such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", add `--resume-last` unless `--fresh` or `--resume-thread <id>` is present.
 - Otherwise forward the task as a fresh `task` run.
 - Preserve the user's task text as-is apart from stripping routing flags.
 - Return the stdout of the `codex-companion` command exactly as-is.

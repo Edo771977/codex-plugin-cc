@@ -71,7 +71,7 @@ function probeEndpoint(endpoint, timeoutMs) {
     // promise pending forever on a connection that never settles.
     socket.setTimeout(Math.max(1, timeoutMs), () => finish("timeout"));
     socket.on("connect", () => finish("connect"));
-    socket.on("error", (error) => finish(error?.code ?? "error"));
+    socket.on("error", (/** @type {NodeJS.ErrnoException} */ error) => finish(error?.code ?? "error"));
   });
 }
 
@@ -442,7 +442,7 @@ export async function shutdownBrokerSession(cwd, options = {}) {
 async function shutdownBrokerSessionLocked(cwd, options = {}) {
   const session = loadBrokerSession(cwd);
   if (!session) {
-    return { found: false, exited: true, forced: false, reclaimedStaleEndpoint: false };
+    return { found: false, exited: true, forced: false, refused: false, reclaimedStaleEndpoint: false };
   }
 
   const pid = resolveBrokerPid(session);
@@ -469,7 +469,7 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
   if (legacySession) {
     if (canDiscardUnownedSession(session, pid, livenessOptions)) {
       teardownAndClear(cwd, session, false);
-      return { found: true, exited: true, forced: false, reclaimedStaleEndpoint: false };
+      return { found: true, exited: true, forced: false, refused: false, reclaimedStaleEndpoint: false };
     }
     legacyProcessVerified = processMatchesLegacyBroker(session, pid, options);
     const legacyEndpointIsSafelyStale =
@@ -485,6 +485,17 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
       timeoutMs: options.timeoutMs,
       instanceToken: session.instanceToken
     });
+  }
+  // A busy refusal is not an identity rejection: the broker recognized us and
+  // declined because another connection is still admitted. That is the normal
+  // outcome when a client connects between the session-end guard check and
+  // this request, so it must not raise -- the hook's own pre-check treats a
+  // refusal as "leave the runtime for the survivors", and a throw here made
+  // SessionEnd exit(1) blaming the instance token instead. Leave the process
+  // and the persisted record alone; a later session end (or the broker's own
+  // idle shutdown) retires it.
+  if (shutdownResponse?.refused) {
+    return { found: true, exited: false, forced: false, refused: true, reclaimedStaleEndpoint: false };
   }
   if (shutdownResponse?.error) {
     throw new Error(
@@ -583,7 +594,7 @@ async function shutdownBrokerSessionLocked(cwd, options = {}) {
 
   const endpointIsOurs = endpointProven || reclaimedStaleEndpoint;
   teardownAndClear(cwd, session, endpointIsOurs);
-  return { found: true, exited: true, forced, reclaimedStaleEndpoint };
+  return { found: true, exited: true, forced, refused: false, reclaimedStaleEndpoint };
 }
 
 export async function ensureBrokerSession(cwd, options = {}) {

@@ -116,13 +116,24 @@ function send(message) {
   process.stdout.write(JSON.stringify(message) + "\\n");
 }
 
-function nextThread(state, cwd, ephemeral) {
+function sandboxPolicy(mode) {
+  if (mode === "danger-full-access") {
+    return { type: "dangerFullAccess" };
+  }
+  if (mode === "workspace-write") {
+    return { type: "workspaceWrite", writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false };
+  }
+  return { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false };
+}
+
+function nextThread(state, cwd, ephemeral, sandbox) {
   const thread = {
     id: "thr_" + state.nextThreadId++,
     cwd: cwd || process.cwd(),
     name: null,
     preview: "",
     ephemeral: Boolean(ephemeral),
+    sandbox: sandbox || "read-only",
     createdAt: now(),
     updatedAt: now()
   };
@@ -309,11 +320,20 @@ rl.on("line", (line) => {
         if (BEHAVIOR === "auth-run-fails") {
           throw new Error("authentication expired; run codex login");
         }
+        if (BEHAVIOR === "permission-profiles-unsupported" && message.params.config) {
+          throw new Error("unknown field config.default_permissions");
+        }
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
-        const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        const thread = nextThread(state, message.params.cwd, message.params.ephemeral, message.params.sandbox);
+        state.lastThreadStart = {
+          ...message.params,
+          threadId: thread.id,
+          approvalPolicy: message.params.approvalPolicy ?? null
+        };
+        saveState(state);
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: sandboxPolicy(thread.sandbox), reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
       }
@@ -341,13 +361,24 @@ rl.on("line", (line) => {
       }
 
       case "thread/resume": {
+        if (BEHAVIOR === "permission-profiles-unsupported" && message.params.config) {
+          throw new Error("unknown field config.default_permissions");
+        }
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
         const thread = ensureThread(state, message.params.threadId);
+        if (message.params.cwd) {
+          thread.cwd = message.params.cwd;
+        }
         thread.updatedAt = now();
+        const resumedPolicy = BEHAVIOR === "external-sandbox" ? { type: "externalSandbox", networkAccess: "restricted" } : sandboxPolicy(thread.sandbox);
+        state.lastThreadResume = {
+          ...message.params,
+          threadId: thread.id
+        };
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: resumedPolicy, reasoningEffort: null } });
         break;
       }
 
@@ -670,6 +701,7 @@ export function buildEnv(binDir) {
   const sep = process.platform === "win32" ? ";" : ":";
   return {
     ...process.env,
+    CODEX_HOME: path.join(binDir, "codex-home"),
     PATH: `${binDir}${sep}${process.env.PATH}`
   };
 }

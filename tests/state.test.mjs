@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir } from "./helpers.mjs";
 import {
+  getConfig,
   listJobs,
   resolveJobFile,
   resolveJobLogFile,
@@ -16,9 +17,10 @@ import {
   resolveStateDir,
   resolveStateFile,
   saveState,
+  setConfig,
   writeJobFile
 } from "../plugins/codex/scripts/lib/state.mjs";
-import { createJobLogFile } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
+import { createJobLogFile, runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -68,6 +70,28 @@ test("state, job, and log artifacts are private", { skip: process.platform === "
   assert.equal(fs.statSync(resolveStateFile(workspace)).mode & 0o777, 0o600);
   assert.equal(fs.statSync(jobFile).mode & 0o777, 0o600);
   assert.equal(fs.statSync(logFile).mode & 0o777, 0o600);
+});
+
+test("review-gate config remains authoritative when CLAUDE_PLUGIN_DATA changes", () => {
+  const workspace = makeTempDir();
+  const codexHome = makeTempDir();
+  const pluginDataA = makeTempDir();
+  const pluginDataB = makeTempDir();
+  const previousCodexHome = process.env.CODEX_HOME;
+  const previousPluginData = process.env.CLAUDE_PLUGIN_DATA;
+  try {
+    process.env.CODEX_HOME = codexHome;
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataA;
+    setConfig(workspace, "stopReviewGate", true);
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataB;
+    assert.equal(getConfig(workspace).stopReviewGate, true);
+    setConfig(workspace, "stopReviewGate", false);
+    process.env.CLAUDE_PLUGIN_DATA = pluginDataA;
+    assert.equal(getConfig(workspace).stopReviewGate, false);
+  } finally {
+    if (previousCodexHome == null) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previousCodexHome;
+    if (previousPluginData == null) delete process.env.CLAUDE_PLUGIN_DATA; else process.env.CLAUDE_PLUGIN_DATA = previousPluginData;
+  }
 });
 
 test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", () => {
@@ -282,4 +306,92 @@ test("writeJobFile never exposes a torn record to a concurrent reader", async (t
   const exitCode = await done;
   assert.equal(exitCode, 0, `concurrent reader observed a torn job record: ${readerErr.trim()}`);
   assert.deepEqual(readJobFile(jobFile).id, jobId);
+});
+
+test("runTrackedJob persists errorMessage on a non-throwing failed execution", async () => {
+  const workspace = makeTempDir();
+  const job = {
+    id: "task-fail-nonthrowing",
+    kind: "task",
+    kindLabel: "Task",
+    title: "Codex Task",
+    workspaceRoot: workspace,
+    jobClass: "task",
+    summary: "",
+    write: false,
+    createdAt: new Date().toISOString()
+  };
+
+  await runTrackedJob(
+    job,
+    async () => ({
+      exitStatus: 400,
+      threadId: "thread-1",
+      turnId: "turn-1",
+      payload: { status: 400, rawOutput: "{\n  \"type\": \"error\"\n}", touchedFiles: [] },
+      rendered: "rendered output\n",
+      summary: "Unsupported value: 'x' is not supported.",
+      errorMessage: "Unsupported value: 'x' is not supported with the 'gpt-5.6-terra' model."
+    }),
+    {}
+  );
+
+  const storedJob = JSON.parse(
+    fs.readFileSync(resolveJobFile(workspace, job.id), "utf8")
+  );
+  const state = JSON.parse(fs.readFileSync(resolveStateFile(workspace), "utf8"));
+  const indexed = state.jobs.find((entry) => entry.id === job.id);
+
+  assert.equal(storedJob.status, "failed");
+  assert.equal(storedJob.phase, "failed");
+  assert.equal(
+    storedJob.errorMessage,
+    "Unsupported value: 'x' is not supported with the 'gpt-5.6-terra' model."
+  );
+  assert.equal(indexed.status, "failed");
+  assert.equal(
+    indexed.errorMessage,
+    "Unsupported value: 'x' is not supported with the 'gpt-5.6-terra' model."
+  );
+  assert.equal(indexed.summary, "Unsupported value: 'x' is not supported.");
+});
+
+test("runTrackedJob stores no errorMessage for a completed execution", async () => {
+  const workspace = makeTempDir();
+  const job = {
+    id: "task-ok",
+    kind: "task",
+    kindLabel: "Task",
+    title: "Codex Task",
+    workspaceRoot: workspace,
+    jobClass: "task",
+    summary: "",
+    write: false,
+    createdAt: new Date().toISOString()
+  };
+
+  await runTrackedJob(
+    job,
+    async () => ({
+      exitStatus: 0,
+      threadId: "thread-2",
+      turnId: "turn-2",
+      payload: { status: 0, rawOutput: "OK", touchedFiles: [] },
+      rendered: "OK\n",
+      summary: "OK",
+      errorMessage: null
+    }),
+    {}
+  );
+
+  const storedJob = JSON.parse(
+    fs.readFileSync(resolveJobFile(workspace, job.id), "utf8")
+  );
+  const state = JSON.parse(fs.readFileSync(resolveStateFile(workspace), "utf8"));
+  const indexed = state.jobs.find((entry) => entry.id === job.id);
+
+  assert.equal(storedJob.status, "completed");
+  assert.equal(storedJob.errorMessage, null);
+  assert.equal(indexed.status, "completed");
+  assert.equal(indexed.errorMessage, null);
 });

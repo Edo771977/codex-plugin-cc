@@ -366,6 +366,8 @@ export async function runTrackedJob(job, runner, options = {}) {
       return execution;
     }
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
+    const errorMessage =
+      completionStatus === "failed" ? (execution.errorMessage ?? null) : null;
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
@@ -375,6 +377,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       pid: null,
       phase: completionStatus === "completed" ? "done" : "failed",
       completedAt,
+      errorMessage,
       result: execution.payload,
       rendered: execution.rendered
     });
@@ -386,6 +389,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       summary: execution.summary,
       phase: completionStatus === "completed" ? "done" : "failed",
       pid: null,
+      errorMessage,
       completedAt
     });
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
