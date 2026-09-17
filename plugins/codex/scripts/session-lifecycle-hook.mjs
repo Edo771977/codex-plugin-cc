@@ -87,24 +87,32 @@ function setEnv(name, value) {
   // CLAUDE_ENV_FILE is shared with every other plugin's SessionStart hook and is
   // append-only by convention. Rewriting it (read, filter, rename) drops any
   // export another hook appended between the read and the rename, and the
-  // rename replaces the file, discarding its mode along with it. So append —
-  // and skip the append when the value the file already resolves to is ours.
-  // The shell takes the last export for a key, so this keeps the file from
-  // growing on every session without ever removing a line somebody else wrote.
+  // rename replaces the file, discarding its mode along with it. So append.
+  //
+  // That means a value that changes every session (the session id, the
+  // transcript path) adds a line every session: the shell takes the last
+  // export for a key, so the file stays correct while it grows. Only an
+  // unchanged value is skipped. Bounded growth is the price of never
+  // destroying another plugin's export.
+  let content = "";
   try {
-    const existing = fs
-      .readFileSync(envFile, "utf8")
-      .split(/\r?\n/)
-      .filter((entry) => entry.startsWith(prefix))
-      .at(-1);
-    if (existing === line) {
-      return;
-    }
+    content = fs.readFileSync(envFile, "utf8");
   } catch (err) {
     if (err.code !== "ENOENT") throw err;
   }
 
-  fs.appendFileSync(envFile, `${line}\n`, "utf8");
+  const existing = content
+    .split(/\r?\n/)
+    .filter((entry) => entry.startsWith(prefix))
+    .at(-1);
+  if (existing === line) {
+    return;
+  }
+
+  // A hook that appended without a trailing newline would otherwise have its
+  // line and ours run together, losing both exports.
+  const separator = content === "" || content.endsWith("\n") ? "" : "\n";
+  fs.appendFileSync(envFile, `${separator}${line}\n`, "utf8");
 }
 
 // A pid-less active record has no liveness signal at all (current code
@@ -302,10 +310,18 @@ async function cleanupSessionJobs(cwd, sessionId, { interruptTurns = false, inte
       // turn id, so the Codex turn may still be running and there is nothing to
       // interrupt it by. Cancelling the record here would claim an outcome that
       // did not happen; leave it active (its phase says why) for the next
-      // status query. The pid is written back rather than nulled: it is what
-      // lets that query reconcile the job again instead of trusting a stale
-      // "running".
-      upsertJob(workspaceRoot, { id: job.id, phase: reconciled.phase, pid: workerPid, threadId });
+      // status query. The verdict is persisted instead of the pid: writing a
+      // dead pid back would let another session's dead-worker reaper fail the
+      // record and stop it pinning the broker — tearing the runtime down under
+      // the very turn this retain protects. A pid-less active record keeps the
+      // broker up (bounded by the staleness rule) and reconciles from the flag.
+      upsertJob(workspaceRoot, {
+        id: job.id,
+        phase: reconciled.phase,
+        pid: null,
+        threadId,
+        workerExited: true
+      });
       continue;
     }
     jobsAwaitingInterrupt -= 1;

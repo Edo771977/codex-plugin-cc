@@ -165,7 +165,20 @@ function acquireStagingLease(stagedPath, staged) {
 
   return {
     release() {
-      withStagingLock(stagedPath, () => {
+      // Called from a finally: a staging lock that is busy (5s) or unusable
+      // must never surface in place of the import error that is unwinding.
+      // Dropping our own lease needs no lock — the path is unique to us — so
+      // the fallback still frees the staged copy for whoever leaves last.
+      try {
+        releaseLocked();
+      } catch {
+        try { fs.unlinkSync(leasePath); } catch (error) { if (error?.code !== "ENOENT") { /* nothing left to do */ } }
+      }
+    }
+  };
+
+  function releaseLocked() {
+    withStagingLock(stagedPath, () => {
         try { fs.unlinkSync(leasePath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
         const activeLeases = fs.readdirSync(directory).filter((name) => name.startsWith(leasePrefix));
         // Cleanup belongs to whoever leaves last, not to whoever created the
@@ -177,10 +190,9 @@ function acquireStagingLease(stagedPath, staged) {
           return;
         }
         try { fs.unlinkSync(stagedPath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
-        try { fs.unlinkSync(markerPath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
-      });
-    }
-  };
+      try { fs.unlinkSync(markerPath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+    });
+  }
 }
 
 function isWithin(root, candidate) {

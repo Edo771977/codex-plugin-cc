@@ -120,6 +120,21 @@ function sandboxModeForPolicy(policy) {
   return null;
 }
 
+// A scoped run constrains reads through a permission profile, which cannot
+// take back what a thread started with `danger-full-access` already has: the
+// sandbox is off for that thread, so the scope would be a promise this plugin
+// cannot keep.
+function assertScopedResumeNotEscalated(threadId, response) {
+  const effectiveMode = sandboxModeForPolicy(response?.sandbox);
+  if (effectiveMode !== "danger-full-access") {
+    return;
+  }
+  throw new Error(
+    `Thread ${threadId} runs with the Codex sandbox disabled (danger-full-access), so --read-root cannot scope it. ` +
+      "Start a fresh thread with --fresh to run scoped."
+  );
+}
+
 function assertResumedSandbox(threadId, requestedMode, response) {
   if (!requestedMode || !SANDBOX_POLICY_TYPES.has(requestedMode)) {
     return;
@@ -1335,13 +1350,16 @@ export async function runAppServerTurn(cwd, options = {}) {
           write: options.write,
           ephemeral: false
         });
-        // Only meaningful when the resume actually asked for a sandbox mode.
         // With read roots, buildThreadAccessParams() deliberately sends a
         // scoped permission profile and no `sandbox`, so the app-server's
-        // reported mode is not the one this turn requested: asserting it here
+        // reported mode is not the one this turn requested: asserting it
         // refused every `--read-root` resume, and the error's own advice
         // (resume with the reported mode) silently dropped the write grant.
-        if (!(options.readRoots?.length > 0)) {
+        // The escalation half of that check still applies, though — a thread
+        // started with the sandbox disabled is not scoped by any profile.
+        if (options.readRoots?.length > 0) {
+          assertScopedResumeNotEscalated(options.resumeThreadId, response);
+        } else {
           assertResumedSandbox(options.resumeThreadId, options.sandbox, response);
         }
         threadId = response.thread.id;

@@ -29,7 +29,17 @@ function isActiveJob(job) {
 }
 
 export function reconcileJobLiveness(job, options = {}) {
-  if (!isActiveJob(job) || !Number.isSafeInteger(job.pid) || job.pid <= 0) {
+  if (!isActiveJob(job)) {
+    return job;
+  }
+  // A record whose worker was already found gone carries the verdict itself:
+  // the pid is dropped when that is persisted (a dead pid would let the
+  // dead-worker reaper fail the job and stop it pinning the broker, under a
+  // turn that may still be running), so there is nothing left to probe.
+  if (job.workerExited === true && job.threadId) {
+    return { ...job, status: "running", phase: "worker-exited-turn-unknown", pid: null, workerExited: true };
+  }
+  if (!Number.isSafeInteger(job.pid) || job.pid <= 0) {
     return job;
   }
 

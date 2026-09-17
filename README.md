@@ -378,7 +378,7 @@ Commands and flags:
 | [#729](https://github.com/openai/codex-plugin-cc/pull/729) | `/codex:transfer` works with a relocated `CLAUDE_CONFIG_DIR` |
 | [#742](https://github.com/openai/codex-plugin-cc/pull/742) | `--sandbox <mode>` on `task` and `/codex:rescue` |
 | [#746](https://github.com/openai/codex-plugin-cc/pull/746) | `--model`/`--effort` on the review commands, and a warning for unrecognised options |
-| [#748](https://github.com/openai/codex-plugin-cc/pull/748) | `CLAUDE_ENV_FILE` keeps one export per key instead of growing on every session |
+| [#748](https://github.com/openai/codex-plugin-cc/pull/748) | `CLAUDE_ENV_FILE` skips re-exporting an unchanged value (its rewrite-the-file mechanism is not used: the file is shared with other plugins' hooks, so this fork only ever appends to it) |
 | [#731](https://github.com/openai/codex-plugin-cc/pull/731) | the review-gate flag is persisted outside the transient state dir, so a different `CLAUDE_PLUGIN_DATA` no longer silently disables it |
 | [#737](https://github.com/openai/codex-plugin-cc/pull/737) | hooks resolve Node through `scripts/run-node.sh`, so nvm/fnm/asdf/mise/Volta/Homebrew toolchains work under the minimal hook PATH |
 | [#747](https://github.com/openai/codex-plugin-cc/pull/747) | `runCommand` sets an explicit 256 MiB `maxBuffer`, so a large `git diff` is no longer truncated at Node's 1 MiB default |

@@ -5687,12 +5687,23 @@ test("a retained orphaned turn stays reconcilable after session end", () => {
 
   const retained = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs[0];
   assert.equal(retained.status, "running");
-  // Written back rather than nulled: reconcileJobLiveness() needs a pid, so a
-  // record retained without one can never be judged again and stays "running"
-  // forever in /codex:status.
-  assert.equal(retained.pid, 999999);
   assert.equal(retained.threadId, "thr_pending");
   assert.equal(retained.phase, "worker-exited-turn-unknown");
+  // The verdict is persisted, not the dead pid: the record has to stay
+  // reconcilable without handing the dead-worker reaper something to fail.
+  assert.equal(retained.pid, null);
+  assert.equal(retained.workerExited, true);
+
+  // Another session ending must not reap it: its turn may still be running,
+  // and failing the record would also stop it pinning the shared broker.
+  const other = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: workspace,
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-other" },
+    input: JSON.stringify({ hook_event_name: "SessionEnd", session_id: "sess-other", cwd: workspace })
+  });
+  assert.equal(other.status, 0, other.stderr);
+  const afterOther = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs[0];
+  assert.equal(afterOther.status, "running");
 });
 
 

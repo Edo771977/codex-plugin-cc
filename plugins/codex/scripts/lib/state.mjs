@@ -218,6 +218,17 @@ function resolveStateLockDir(cwd) {
 // So take that root's lock too -- but never wait for it. Two processes holding
 // each other's primary lock would deadlock, and this prune is not urgent: the
 // pruned ids stay pruned in this root, and the next save re-runs it.
+// Everything a single root holds for one job: its detail file, its terminal
+// claim, and its log when the log lives in that root.
+function removeJobArtifacts(stateDir, job) {
+  const jobsDir = path.join(stateDir, JOBS_DIR_NAME);
+  removeFileIfExists(path.join(jobsDir, `${job.id}.json`));
+  removeFileIfExists(path.join(jobsDir, `${job.id}.terminal`));
+  if (typeof job.logFile === "string" && job.logFile.startsWith(`${stateDir}${path.sep}`)) {
+    removeFileIfExists(job.logFile);
+  }
+}
+
 function pruneOtherStateRoot(otherStateDir, retainedIds) {
   const otherStateFile = path.join(otherStateDir, STATE_FILE_NAME);
   if (!fs.existsSync(otherStateFile)) {
@@ -236,6 +247,11 @@ function pruneOtherStateRoot(otherStateDir, retainedIds) {
           return;
         }
         writeJsonFileAtomic(otherStateFile, { ...otherParsed, jobs: prunedOtherJobs });
+        for (const job of otherJobs) {
+          if (!retainedIds.has(job.id)) {
+            removeJobArtifacts(otherStateDir, job);
+          }
+        }
       },
       { timeoutMs: 0 }
     );
@@ -257,17 +273,17 @@ function saveStateLocked(cwd, state) {
   };
 
   const retainedIds = new Set(nextJobs.map((job) => job.id));
+  const primaryStateDir = resolveStateDir(cwd);
   for (const job of previousJobs) {
     if (retainedIds.has(job.id)) {
       continue;
     }
-    for (const jobFile of resolveJobFileCandidates(cwd, job.id)) {
-      removeFileIfExists(jobFile);
-    }
-    for (const claimFile of resolveJobClaimFileCandidates(cwd, job.id)) {
-      removeFileIfExists(claimFile);
-    }
-    removeFileIfExists(job.logFile);
+    // Only this root's copies. Pruning another root's state.json is
+    // best-effort (it needs that root's lock), so deleting its files here
+    // would leave a record that is merged back in — and rewritten into the
+    // primary — with its detail file, claim and log already gone. Each root's
+    // files go when its own record does.
+    removeJobArtifacts(primaryStateDir, job);
   }
 
   writeJsonFileAtomic(resolveStateFile(cwd), nextState);
