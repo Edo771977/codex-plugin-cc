@@ -400,6 +400,10 @@ export function processHasLaunchToken(pid, token, options = {}) {
  * Only meaningful for a group leader; a caller that is not one signals nothing, which is the
  * existing behaviour of `terminateProcessTree`.
  */
+/**
+ * @param {number} pid
+ * @param {{ graceMs?: number, exitCode?: number, beforeKill?: () => void }} [options]
+ */
 export function terminateProcessTreeAndExit(pid, { graceMs = 5000, exitCode = 1, beforeKill } = {}) {
   if (pid === process.pid) {
     process.on("SIGTERM", () => {});

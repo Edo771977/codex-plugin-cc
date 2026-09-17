@@ -71,7 +71,7 @@ function probeEndpoint(endpoint, timeoutMs) {
     // promise pending forever on a connection that never settles.
     socket.setTimeout(Math.max(1, timeoutMs), () => finish("timeout"));
     socket.on("connect", () => finish("connect"));
-    socket.on("error", (error) => finish(error?.code ?? "error"));
+    socket.on("error", (/** @type {NodeJS.ErrnoException} */ error) => finish(error?.code ?? "error"));
   });
 }
 
