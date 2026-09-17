@@ -5,6 +5,12 @@ Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex
 This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
 they already have.
 
+> [!NOTE]
+> This repository is a fork of [`openai/codex-plugin-cc`](https://github.com/openai/codex-plugin-cc).
+> It tracks upstream `main` and carries a set of community pull requests that are still open
+> upstream — mostly broker/background-job lifecycle fixes plus a few extra flags. See
+> [Differences From Upstream](#differences-from-upstream) for the full list.
+
 <video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
 
 ## What You Get
@@ -12,6 +18,24 @@ they already have.
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
 - `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
+- `/codex:setup` to check that Codex is installed and signed in, and to toggle the optional stop-time review gate
+
+### Commands At A Glance
+
+| Command | What it does | Main flags |
+| --- | --- | --- |
+| [`/codex:review`](#codexreview) | read-only Codex review of your current work | `--wait`, `--background`, `--base <ref>`, `--scope <auto\|working-tree\|branch>`, `--model <model\|spark>`, `--effort <level>` |
+| [`/codex:adversarial-review`](#codexadversarial-review) | steerable review that challenges the approach | same as `/codex:review`, plus free-form focus text |
+| [`/codex:rescue`](#codexrescue) | delegate investigation or a fix to Codex | `--background`, `--wait`, `--resume`, `--resume-thread <id>`, `--fresh`, `--model`, `--effort`, `--write`, `--sandbox <mode>`, `--read-root <dir>` |
+| [`/codex:transfer`](#codextransfer) | turn this Claude session into a resumable Codex thread | `--source <claude-jsonl>` |
+| [`/codex:status`](#codexstatus) | show active and recent Codex jobs | `[job-id]`, `--wait`, `--timeout-ms <ms>`, `--all` |
+| [`/codex:result`](#codexresult) | show the stored output of a finished job | `[job-id]` |
+| [`/codex:cancel`](#codexcancel) | cancel an active background job | `[job-id]` |
+| [`/codex:setup`](#codexsetup) | check the Codex install, manage the review gate | `--enable-review-gate`, `--disable-review-gate` |
+
+Accepted `--effort` values are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`. An
+unrecognised `--flag` is not silently swallowed into the prompt: the plugin warns on stderr and
+passes the token through as text.
 
 ## Requirements
 
@@ -24,8 +48,11 @@ they already have.
 Add the marketplace in Claude Code:
 
 ```bash
-/plugin marketplace add openai/codex-plugin-cc
+/plugin marketplace add Edo771977/codex-plugin-cc
 ```
+
+(Use `openai/codex-plugin-cc` instead if you want upstream without the imported fixes. The
+marketplace name is `openai-codex` either way, so only one of the two can be added at a time.)
 
 Install the plugin:
 
@@ -86,7 +113,7 @@ Use it when you want:
 - a review of your current uncommitted changes
 - a review of your branch compared to a base branch like `main`
 
-Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
+Use `--base <ref>` for branch review. It also supports `--wait`, `--background`, `--scope <auto|working-tree|branch>`, and — like `/codex:rescue` — `--model <model|spark>` and `--effort <level>` to pick the reviewing model and how hard it thinks. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
 
 Examples:
 
@@ -94,6 +121,7 @@ Examples:
 /codex:review
 /codex:review --base main
 /codex:review --background
+/codex:review --base main --model gpt-5.4-mini --effort high
 ```
 
 This command is read-only and will not perform any changes. When run in the background you can use [`/codex:status`](#codexstatus) to check on the progress and [`/codex:cancel`](#codexcancel) to cancel the ongoing task.
@@ -105,7 +133,7 @@ Runs a **steerable** review that questions the chosen implementation and design.
 It can be used to pressure-test assumptions, tradeoffs, failure modes, and whether a different approach would have been safer or simpler.
 
 It uses the same review target selection as `/codex:review`, including `--base <ref>` for branch review.
-It also supports `--wait` and `--background`. Unlike `/codex:review`, it can take extra focus text after the flags.
+It also supports `--wait`, `--background`, `--model <model|spark>`, and `--effort <level>`. Unlike `/codex:review`, it can take extra focus text after the flags.
 
 Use it when you want:
 
@@ -137,7 +165,7 @@ Use it when you want Codex to:
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, `--fresh`, and `--sandbox <read-only|workspace-write|danger-full-access>`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--resume`, `--resume-thread <id>`, `--fresh`, `--model <model|spark>`, `--effort <level>`, `--write`, `--sandbox <read-only|workspace-write|danger-full-access>`, and repeatable `--read-root <directory>`. If you omit the resume flags, the plugin can offer to continue the latest rescue thread for this repo.
 
 Examples:
 
@@ -145,6 +173,7 @@ Examples:
 /codex:rescue investigate why the tests started failing
 /codex:rescue fix the failing test with the smallest safe patch
 /codex:rescue --resume apply the top fix from the last run
+/codex:rescue --resume-thread thr_0199... keep working on that specific thread
 /codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
 /codex:rescue --model spark fix the issue quickly
 /codex:rescue --background investigate the regression
@@ -164,6 +193,7 @@ Ask Codex to redesign the database connection to be more resilient.
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
+- `--resume`/`--resume-last` continues the newest thread for this repository; `--resume-thread <id>` continues one specific thread (the id is printed by `/codex:status` and `/codex:result`). `--resume`, `--resume-thread`, and `--fresh` are mutually exclusive.
 - `--sandbox` applies to `/codex:rescue` only; the review commands stay read-only. It takes precedence over `--write` and counts only before the task text. Rescue runs edit files inside the repository by default (`workspace-write`); `read-only` blocks edits, and `danger-full-access` disables the Codex sandbox entirely, so Codex can write outside the repository and use the network without asking. Reserve it for tasks the sandbox blocks.
 - a resumed thread keeps the sandbox it was started with while the plugin's shared app-server still holds it, which is the normal case inside one Claude Code session (Codex CLI 0.153.2 applies a new mode only when it loads the thread again from disk). `task` refuses a resume whose sandbox differs from what the app-server reports; resume with the same `--sandbox`, or start a new thread with `--fresh`.
 - each `--read-root <directory>` must name an existing directory and opts into an OS-enforced permission profile that denies local command reads outside the listed directories and Codex's minimal runtime paths
@@ -184,7 +214,7 @@ Examples:
 /codex:transfer --source ~/.claude/projects/-Users-me-repo/<session-id>.jsonl
 ```
 
-The plugin's existing `SessionStart` hook supplies the current transcript path automatically; `--source` is available as a manual override. The transfer uses Codex's external-agent session importer, so it follows the same conversion rules as importing Claude history in the Codex App and creates visible turns that can be continued in the App or TUI. The source must be under `~/.claude/projects`, and older Codex versions that do not expose session import must be upgraded before using this command.
+The plugin's existing `SessionStart` hook supplies the current transcript path automatically; `--source` is available as a manual override. The transfer uses Codex's external-agent session importer, so it follows the same conversion rules as importing Claude history in the Codex App and creates visible turns that can be continued in the App or TUI. The source must live under a Claude projects root — `~/.claude/projects`, or `$CLAUDE_CONFIG_DIR/projects` when you have relocated your Claude config — and older Codex versions that do not expose session import must be upgraded before using this command.
 
 ### `/codex:status`
 
@@ -241,6 +271,8 @@ You can also use `/codex:setup` to manage the optional review gate.
 ```
 
 When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted Codex review based on Claude's response. If that review finds issues, the stop is blocked so Claude can address them first.
+
+On the continuation turn that follows a block, the gate does not review again: Claude Code re-invokes the hook with `stop_hook_active`, and re-running the review there would just block again until the harness's retry cap ends the turn. The skip is reported as a system message, so run `/codex:review --wait` yourself when you want the fixes verified.
 
 > [!WARNING]
 > The review gate can create a long-running Claude/Codex loop and may drain usage limits quickly. Only enable it when you plan to actively monitor the session.
@@ -317,6 +349,35 @@ These are advanced knobs for tuning resource usage in long-running or resource-c
 Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
 
 This way you can review the Codex work or continue the work there.
+
+## Differences From Upstream
+
+This fork is [`openai/codex-plugin-cc`](https://github.com/openai/codex-plugin-cc) `main` plus a
+set of community pull requests that are still open upstream. Each one is a separate merge commit,
+so any of them can be reverted on its own.
+
+Broker and background-job lifecycle:
+
+| Upstream PR | What it fixes |
+| --- | --- |
+| [#541](https://github.com/openai/codex-plugin-cc/pull/541) | broker leaks, state races, and signal-masked command failures in the test runtime |
+| [#623](https://github.com/openai/codex-plugin-cc/pull/623) | session end no longer tears down the shared broker while another session's jobs are still using it |
+| [#652](https://github.com/openai/codex-plugin-cc/pull/652) | bounds the lifetime of detached brokers and task workers (see [Background Runtime Limits](#background-runtime-limits)) |
+
+Commands and flags:
+
+| Upstream PR | What it adds |
+| --- | --- |
+| [#565](https://github.com/openai/codex-plugin-cc/pull/565) | the stop-review gate honors `stop_hook_active` instead of re-blocking a continuation turn |
+| [#724](https://github.com/openai/codex-plugin-cc/pull/724) | `--read-root <directory>` for OS-enforced scoped reads |
+| [#727](https://github.com/openai/codex-plugin-cc/pull/727) | `--resume-thread <id>` to continue one specific Codex thread |
+| [#729](https://github.com/openai/codex-plugin-cc/pull/729) | `/codex:transfer` works with a relocated `CLAUDE_CONFIG_DIR` |
+| [#742](https://github.com/openai/codex-plugin-cc/pull/742) | `--sandbox <mode>` on `task` and `/codex:rescue` |
+| [#746](https://github.com/openai/codex-plugin-cc/pull/746) | `--model`/`--effort` on the review commands, and a warning for unrecognised options |
+| [#748](https://github.com/openai/codex-plugin-cc/pull/748) | `CLAUDE_ENV_FILE` keeps one export per key instead of growing on every session |
+
+Where two of these PRs disagreed, the merge commit says which side won and why. The plugin version
+is deliberately left at the upstream number: these merges do not cut a release.
 
 ## FAQ
 
