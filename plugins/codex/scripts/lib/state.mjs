@@ -17,6 +17,7 @@ const CODEX_HOME_ENV = "CODEX_HOME";
 const CONFIG_DIR_NAME = path.join("plugin-cc", "config");
 const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
+const STATE_LOCK_DIR_NAME = ".state.lock";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
 const MIN_TERMINAL_JOBS = 10;
@@ -149,12 +150,18 @@ export function loadState(cwd) {
   // an opt-in toward stricter/safer behavior, so any candidate setting it
   // true wins over a stale false elsewhere -- reconciling by "primary wins"
   // could silently downgrade an explicitly-enabled gate.
+  //
+  // Candidates are folded in reverse (fallback first, primary last) so the
+  // primary root wins for anything that is not a boolean. The previous
+  // "first writer wins" rule was dead for every key defaults already define —
+  // which is all of them — so a non-boolean setting could never be read back
+  // from any root.
   const mergedConfig = { ...defaultState().config };
-  for (const parsed of parsedCandidates) {
+  for (const parsed of [...parsedCandidates].reverse()) {
     for (const [key, value] of Object.entries(parsed.config ?? {})) {
       if (typeof value === "boolean") {
         mergedConfig[key] = mergedConfig[key] === true || value === true;
-      } else if (mergedConfig[key] === undefined) {
+      } else {
         mergedConfig[key] = value;
       }
     }
@@ -202,7 +209,39 @@ function pruneJobs(jobs) {
 }
 
 function resolveStateLockDir(cwd) {
-  return path.join(resolveStateDir(cwd), ".state.lock");
+  return path.join(resolveStateDir(cwd), STATE_LOCK_DIR_NAME);
+}
+
+// Rewriting another root's state.json is a read-modify-write on a file whose
+// own lock is not the one saveState() holds: a process whose primary IS that
+// root can be mid-update, and the rename would drop everything it just wrote.
+// So take that root's lock too -- but never wait for it. Two processes holding
+// each other's primary lock would deadlock, and this prune is not urgent: the
+// pruned ids stay pruned in this root, and the next save re-runs it.
+function pruneOtherStateRoot(otherStateDir, retainedIds) {
+  const otherStateFile = path.join(otherStateDir, STATE_FILE_NAME);
+  if (!fs.existsSync(otherStateFile)) {
+    return;
+  }
+  try {
+    withLockSync(
+      path.join(otherStateDir, STATE_LOCK_DIR_NAME),
+      () => {
+        // Re-read under the lock: the copy this decision was made from could
+        // have been replaced while the lock was being taken.
+        const otherParsed = readStateFileIfValid(otherStateFile);
+        const otherJobs = Array.isArray(otherParsed?.jobs) ? otherParsed.jobs : [];
+        const prunedOtherJobs = otherJobs.filter((job) => retainedIds.has(job.id));
+        if (prunedOtherJobs.length === otherJobs.length) {
+          return;
+        }
+        writeJsonFileAtomic(otherStateFile, { ...otherParsed, jobs: prunedOtherJobs });
+      },
+      { timeoutMs: 0 }
+    );
+  } catch {
+    // Busy or unlockable: leave that root alone rather than racing its owner.
+  }
 }
 
 function saveStateLocked(cwd, state) {
@@ -243,14 +282,7 @@ function saveStateLocked(cwd, state) {
   // root, above. This only ever removes.
   const [, ...otherStateDirs] = resolveStateDirCandidates(cwd);
   for (const otherStateDir of otherStateDirs) {
-    const otherStateFile = path.join(otherStateDir, STATE_FILE_NAME);
-    const otherParsed = readStateFileIfValid(otherStateFile);
-    const otherJobs = Array.isArray(otherParsed?.jobs) ? otherParsed.jobs : [];
-    const prunedOtherJobs = otherJobs.filter((job) => retainedIds.has(job.id));
-    if (prunedOtherJobs.length === otherJobs.length) {
-      continue;
-    }
-    writeJsonFileAtomic(otherStateFile, { ...otherParsed, jobs: prunedOtherJobs });
+    pruneOtherStateRoot(otherStateDir, retainedIds);
   }
 
   return nextState;
@@ -323,11 +355,49 @@ function writeDurableConfig(cwd, config) {
   return nextConfig;
 }
 
+// Same lock discipline as pruneOtherStateRoot(): that root's own lock, never
+// waited on. A config copy this misses is corrected by the next write, and by
+// the durable config, which is the authority.
+function syncOtherStateRootConfig(otherStateDir, config) {
+  const otherStateFile = path.join(otherStateDir, STATE_FILE_NAME);
+  if (!fs.existsSync(otherStateFile)) {
+    return;
+  }
+  try {
+    withLockSync(
+      path.join(otherStateDir, STATE_LOCK_DIR_NAME),
+      () => {
+        const otherParsed = readStateFileIfValid(otherStateFile);
+        if (!otherParsed) {
+          return;
+        }
+        writeJsonFileAtomic(otherStateFile, {
+          ...otherParsed,
+          config: { ...(otherParsed.config ?? {}), ...config }
+        });
+      },
+      { timeoutMs: 0 }
+    );
+  } catch {
+    // Busy or unlockable: leave that root alone rather than racing its owner.
+  }
+}
+
 export function setConfig(cwd, key, value) {
   const nextConfig = writeDurableConfig(cwd, { ...getConfig(cwd), [key]: value });
   updateState(cwd, (state) => {
     state.config = { ...state.config, ...nextConfig };
   });
+  // The cached copy in every other root has to follow. loadState() merges
+  // booleans with OR — deliberately, so a gate enabled under one root is not
+  // downgraded by a stale false under another — which also means a stranded
+  // true would outvote this write forever whenever the durable config cannot
+  // be read. Writing the new value everywhere keeps that safety direction
+  // without making "disable" unreachable.
+  const [, ...otherStateDirs] = resolveStateDirCandidates(cwd);
+  for (const otherStateDir of otherStateDirs) {
+    syncOtherStateRootConfig(otherStateDir, nextConfig);
+  }
   return nextConfig;
 }
 

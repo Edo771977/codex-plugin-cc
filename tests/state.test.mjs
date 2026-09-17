@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { makeTempDir } from "./helpers.mjs";
 import { readStoredJob } from "../plugins/codex/scripts/lib/job-control.mjs";
+import { acquireLockSync, releaseLock } from "../plugins/codex/scripts/lib/locking.mjs";
 import {
   getConfig,
   loadState,
@@ -647,3 +648,75 @@ test("a durable config write that fails mid-write leaves the previous config int
   }
 });
 
+
+function withRoots(fn) {
+  const previousPluginData = process.env.CLAUDE_PLUGIN_DATA;
+  const previousCodexHome = process.env.CODEX_HOME;
+  const workspace = makeTempDir();
+  const pluginData = makeTempDir();
+  const codexHome = makeTempDir();
+  process.env.CLAUDE_PLUGIN_DATA = pluginData;
+  process.env.CODEX_HOME = codexHome;
+  const primaryDir = resolveStateDir(workspace);
+  // The second candidate is the tmpdir fallback a CLI invocation without
+  // CLAUDE_PLUGIN_DATA resolves to.
+  const fallbackDir = path.join(os.tmpdir(), "codex-companion", path.basename(primaryDir));
+  fs.mkdirSync(fallbackDir, { recursive: true });
+  try {
+    return fn({ workspace, primaryDir, fallbackDir, codexHome });
+  } finally {
+    fs.rmSync(fallbackDir, { recursive: true, force: true });
+    if (previousPluginData == null) delete process.env.CLAUDE_PLUGIN_DATA;
+    else process.env.CLAUDE_PLUGIN_DATA = previousPluginData;
+    if (previousCodexHome == null) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodexHome;
+  }
+}
+
+test("pruning another state root waits for nobody and clobbers nobody", () => {
+  withRoots(({ workspace, fallbackDir }) => {
+    const fallbackState = path.join(fallbackDir, "state.json");
+    const foreignJob = { id: "task-foreign", status: "completed", updatedAt: "2026-01-01T00:00:00.000Z" };
+    fs.writeFileSync(
+      fallbackState,
+      `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [foreignJob] }, null, 2)}\n`,
+      "utf8"
+    );
+
+    // A process whose primary IS that root, mid-update.
+    const held = acquireLockSync(path.join(fallbackDir, ".state.lock"));
+    try {
+      saveState(workspace, { version: 1, config: { stopReviewGate: false }, jobs: [] });
+      // Rewriting it here would have thrown away whatever the lock holder is
+      // about to write.
+      const untouched = JSON.parse(fs.readFileSync(fallbackState, "utf8"));
+      assert.deepEqual(untouched.jobs, [foreignJob]);
+    } finally {
+      releaseLock(held);
+    }
+
+    // Once nobody holds it, the same prune goes through.
+    saveState(workspace, { version: 1, config: { stopReviewGate: false }, jobs: [] });
+    assert.deepEqual(JSON.parse(fs.readFileSync(fallbackState, "utf8")).jobs, []);
+  });
+});
+
+test("disabling the review gate is not outvoted by a stranded enable in another root", () => {
+  withRoots(({ workspace, fallbackDir, codexHome }) => {
+    setConfig(workspace, "stopReviewGate", true);
+    // A root that was written while CLAUDE_PLUGIN_DATA was unset.
+    fs.writeFileSync(
+      path.join(fallbackDir, "state.json"),
+      `${JSON.stringify({ version: 1, config: { stopReviewGate: true }, jobs: [] }, null, 2)}\n`,
+      "utf8"
+    );
+
+    setConfig(workspace, "stopReviewGate", false);
+
+    // With the durable config gone, getConfig() falls back to merging the
+    // roots, where booleans are ORed. A stranded true would outvote this
+    // disable forever unless the write reached that root too.
+    fs.rmSync(path.join(codexHome, "plugin-cc"), { recursive: true, force: true });
+    assert.equal(getConfig(workspace).stopReviewGate, false);
+  });
+});

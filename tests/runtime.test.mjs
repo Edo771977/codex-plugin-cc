@@ -5694,3 +5694,57 @@ test("a retained orphaned turn stays reconcilable after session end", () => {
   assert.equal(retained.threadId, "thr_pending");
   assert.equal(retained.phase, "worker-exited-turn-unknown");
 });
+
+
+test("the session start hook appends to CLAUDE_ENV_FILE without rewriting it", () => {
+  const repo = makeTempDir();
+  const envFile = path.join(makeTempDir(), "claude-env.sh");
+  const foreignExport = "export SOME_OTHER_PLUGIN_VAR='kept'\n";
+  fs.writeFileSync(envFile, foreignExport, "utf8");
+  fs.chmodSync(envFile, 0o600);
+  const pluginDataDir = makeTempDir();
+  const transcriptPath = path.join(repo, "session.jsonl");
+  const env = {
+    ...process.env,
+    CLAUDE_ENV_FILE: envFile,
+    CLAUDE_PLUGIN_DATA: pluginDataDir
+  };
+  const input = JSON.stringify({
+    hook_event_name: "SessionStart",
+    session_id: "sess-current",
+    transcript_path: transcriptPath,
+    cwd: repo
+  });
+
+  assert.equal(run("node", [SESSION_HOOK, "SessionStart"], { cwd: repo, env, input }).status, 0);
+  assert.equal(run("node", [SESSION_HOOK, "SessionStart"], { cwd: repo, env, input }).status, 0);
+
+  const contents = fs.readFileSync(envFile, "utf8");
+  // The file is shared with every other plugin's SessionStart hook: a rewrite
+  // would drop whatever another hook appended, and replacing the file discards
+  // its mode with it.
+  assert.match(contents, /export SOME_OTHER_PLUGIN_VAR='kept'/);
+  assert.equal(fs.statSync(envFile).mode & 0o777, 0o600);
+  // Re-exporting the same value must not grow the file either.
+  assert.equal(contents.split("\n").filter((line) => line.startsWith("export CODEX_COMPANION_SESSION_ID=")).length, 1);
+
+  // A changed value is appended; the shell takes the last export for a key.
+  assert.equal(
+    run("node", [SESSION_HOOK, "SessionStart"], {
+      cwd: repo,
+      env,
+      input: JSON.stringify({
+        hook_event_name: "SessionStart",
+        session_id: "sess-next",
+        transcript_path: transcriptPath,
+        cwd: repo
+      })
+    }).status,
+    0
+  );
+  const sessionExports = fs
+    .readFileSync(envFile, "utf8")
+    .split("\n")
+    .filter((line) => line.startsWith("export CODEX_COMPANION_SESSION_ID="));
+  assert.equal(sessionExports.at(-1), "export CODEX_COMPANION_SESSION_ID='sess-next'");
+});

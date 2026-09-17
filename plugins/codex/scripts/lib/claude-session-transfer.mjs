@@ -156,15 +156,21 @@ function acquireStagingLease(stagedPath, staged) {
     } else {
       managed = markerMatches;
     }
-    if (managed) fs.writeFileSync(leasePath, "", { flag: "wx" });
+    // The lease is taken whatever `managed` says. A process that attaches to a
+    // staged copy the creator has not yet marked would otherwise hold no lease,
+    // and the creator's release() -- seeing no leases -- deletes the file out
+    // from under it. `managed` only decides whether we may write the marker.
+    fs.writeFileSync(leasePath, "", { flag: "wx" });
   });
 
   return {
     release() {
-      if (!managed) return;
       withStagingLock(stagedPath, () => {
         try { fs.unlinkSync(leasePath); } catch (error) { if (error?.code !== "ENOENT") throw error; }
         const activeLeases = fs.readdirSync(directory).filter((name) => name.startsWith(leasePrefix));
+        // Cleanup belongs to whoever leaves last, not to whoever created the
+        // copy: the marker is what proves the staging is the plugin's, and the
+        // lease count is what proves nobody is still reading it.
         if (activeLeases.length > 0 || !managedMarkerMatches(markerPath)) return;
         if (fs.existsSync(stagedPath) && fileSha256(stagedPath) !== staged.sourceSha256) {
           fs.unlinkSync(markerPath);

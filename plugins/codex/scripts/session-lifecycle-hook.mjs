@@ -84,19 +84,27 @@ function setEnv(name, value) {
   const prefix = `export ${name}=`;
   const line = `${prefix}${shellEscape(value)}`;
 
-  let content = "";
+  // CLAUDE_ENV_FILE is shared with every other plugin's SessionStart hook and is
+  // append-only by convention. Rewriting it (read, filter, rename) drops any
+  // export another hook appended between the read and the rename, and the
+  // rename replaces the file, discarding its mode along with it. So append —
+  // and skip the append when the value the file already resolves to is ours.
+  // The shell takes the last export for a key, so this keeps the file from
+  // growing on every session without ever removing a line somebody else wrote.
   try {
-    content = fs.readFileSync(envFile, "utf8");
+    const existing = fs
+      .readFileSync(envFile, "utf8")
+      .split(/\r?\n/)
+      .filter((entry) => entry.startsWith(prefix))
+      .at(-1);
+    if (existing === line) {
+      return;
+    }
   } catch (err) {
     if (err.code !== "ENOENT") throw err;
   }
 
-  const lines = content.split(/\r?\n/).filter((l) => l && !l.startsWith(prefix));
-  lines.push(line);
-
-  const tmp = `${envFile}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, lines.join("\n") + "\n", "utf8");
-  fs.renameSync(tmp, envFile);
+  fs.appendFileSync(envFile, `${line}\n`, "utf8");
 }
 
 // A pid-less active record has no liveness signal at all (current code
