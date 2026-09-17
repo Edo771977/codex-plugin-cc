@@ -142,9 +142,10 @@ function retainedOrphanExpired(job, env = process.env) {
   if (job?.workerExited !== true) {
     return false;
   }
-  // Unlike every other record, this one is why SessionEnd declines to tear the
-  // broker down, so "cannot tell" must not mean "protected forever": a record
-  // with no readable timestamp has already outlived anything it could protect.
+  // This record is why SessionEnd declines to tear the broker down, so here
+  // "cannot tell" must not mean "protected forever" — isStaleJobRecord()'s
+  // conservative reading of an unparseable timestamp would do exactly that. A
+  // record with no readable timestamp has outlived anything it could protect.
   const reference = job.updatedAt ?? job.createdAt ?? null;
   const timestamp = reference ? Date.parse(reference) : Number.NaN;
   if (!Number.isFinite(timestamp)) {
@@ -552,8 +553,12 @@ async function handleSessionEnd(input) {
   // A turn this session could not interrupt — its worker died before publishing
   // a turn id — may still be running on this broker. The guard below speaks
   // only for other sessions' work, so without this the same hook run would
-  // tear the runtime down under the turn the retain exists to protect. The
-  // broker idles out on its own timer, which is what bounds the wait.
+  // tear the runtime down under the turn the retain exists to protect.
+  //
+  // What ends the wait: normally the broker's own idle timer, since the turn's
+  // client is gone. With that timer disabled the next session end in this
+  // workspace reclaims the broker once the record passes the staleness bound
+  // (see retainedOrphanExpired), so the runtime is held, never stranded.
   if (cleanup?.retainedOrphans > 0) {
     return;
   }

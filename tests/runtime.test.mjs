@@ -5767,3 +5767,63 @@ test("the session start hook appends to CLAUDE_ENV_FILE without rewriting it", (
     .filter((line) => line.startsWith("export CODEX_COMPANION_SESSION_ID="));
   assert.equal(sessionExports.at(-1), "export CODEX_COMPANION_SESSION_ID='sess-next'");
 });
+
+
+function seedRetainedOrphan(workspace, updatedAt) {
+  const stateDir = resolveStateDir(workspace);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({
+      version: 1,
+      config: { stopReviewGate: false },
+      jobs: [{
+        id: "task-orphan", status: "running", title: "Codex Task", jobClass: "task",
+        sessionId: "sess-owner", pid: null, threadId: "thr_pending", workerExited: true, updatedAt
+      }]
+    }, null, 2)}\n`,
+    "utf8"
+  );
+  return stateDir;
+}
+
+function endSessionFor(workspace, env) {
+  return run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: workspace,
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-other", ...env },
+    input: JSON.stringify({ hook_event_name: "SessionEnd", session_id: "sess-other", cwd: workspace })
+  });
+}
+
+test("a retained orphan expires even when the broker idle timer is disabled", () => {
+  const workspace = makeTempDir();
+  const hoursAgo = (hours) => new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+
+  // Two hours old, idle shutdown off: still protected — nothing has proved the
+  // turn is over.
+  let stateDir = seedRetainedOrphan(workspace, hoursAgo(2));
+  assert.equal(endSessionFor(workspace, { CODEX_BROKER_IDLE_SHUTDOWN_MS: "0" }).status, 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs[0].status, "running");
+
+  // Past the generic staleness bound, still with the idle timer off: reaped,
+  // rather than pinning the broker for good.
+  stateDir = seedRetainedOrphan(workspace, hoursAgo(25));
+  assert.equal(endSessionFor(workspace, { CODEX_BROKER_IDLE_SHUTDOWN_MS: "0" }).status, 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs[0].status, "failed");
+
+  // With the timer at ten minutes, the same two-hour-old record is over.
+  stateDir = seedRetainedOrphan(workspace, hoursAgo(2));
+  assert.equal(endSessionFor(workspace, { CODEX_BROKER_IDLE_SHUTDOWN_MS: "600000" }).status, 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs[0].status, "failed");
+});
+
+test("a retained orphan with an unreadable timestamp does not pin the broker forever", () => {
+  const workspace = makeTempDir();
+  const stateDir = seedRetainedOrphan(workspace, "not-a-timestamp");
+
+  assert.equal(endSessionFor(workspace, {}).status, 0);
+
+  // This is the one record that stops a teardown, so an unreadable timestamp
+  // has to count as expired: "cannot tell" must not mean "protected forever".
+  assert.equal(JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8")).jobs[0].status, "failed");
+});
