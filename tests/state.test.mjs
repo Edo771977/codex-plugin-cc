@@ -12,6 +12,7 @@ import { readStoredJob } from "../plugins/codex/scripts/lib/job-control.mjs";
 import {
   getConfig,
   loadState,
+  resolveConfigFile,
   listJobs,
   resolveJobFile,
   resolveJobLogFile,
@@ -591,3 +592,58 @@ test("runTrackedJob stores no errorMessage for a completed execution", async () 
   assert.equal(indexed.status, "completed");
   assert.equal(indexed.errorMessage, null);
 });
+
+
+test("the durable review-gate config is private", { skip: process.platform === "win32" }, () => {
+  const workspace = makeTempDir();
+  const codexHome = makeTempDir();
+  const previousCodexHome = process.env.CODEX_HOME;
+  try {
+    process.env.CODEX_HOME = codexHome;
+    setConfig(workspace, "stopReviewGate", true);
+
+    const configFile = resolveConfigFile(workspace);
+    // The gate decides whether Codex reviews every turn of this workspace, so
+    // it gets the same treatment as every other artifact this module writes:
+    // nobody else on the machine reads or rewrites it.
+    assert.equal(fs.statSync(configFile).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(path.dirname(configFile)).mode & 0o777, 0o700);
+  } finally {
+    if (previousCodexHome == null) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodexHome;
+  }
+});
+
+test("a durable config write that fails mid-write leaves the previous config intact", () => {
+  const workspace = makeTempDir();
+  const codexHome = makeTempDir();
+  const previousCodexHome = process.env.CODEX_HOME;
+  try {
+    process.env.CODEX_HOME = codexHome;
+    setConfig(workspace, "stopReviewGate", true);
+    const configFile = resolveConfigFile(workspace);
+    const before = fs.readFileSync(configFile, "utf8");
+
+    // Fails inside writeJsonFileAtomic(), after it has created its temporary
+    // file: the replacement is interrupted exactly where a crash or a full
+    // disk would interrupt it. The gate decides whether Codex reviews every
+    // turn, so a half-written file must never end up in its place -- that
+    // would read back as unset and silently disable the gate.
+    const explodingValue = {
+      toJSON() {
+        throw new Error("serialization failed mid-write");
+      }
+    };
+    assert.throws(() => setConfig(workspace, "stopReviewGate", explodingValue), /serialization failed mid-write/);
+
+    assert.equal(fs.readFileSync(configFile, "utf8"), before);
+    assert.equal(getConfig(workspace).stopReviewGate, true);
+    // The temporary file is cleaned up, so nothing is left to be mistaken for
+    // the real config.
+    assert.deepEqual(fs.readdirSync(path.dirname(configFile)), [path.basename(configFile)]);
+  } finally {
+    if (previousCodexHome == null) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodexHome;
+  }
+});
+
