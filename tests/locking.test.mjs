@@ -74,13 +74,22 @@ test("lock immediately reclaims an owner process that exited", async () => {
     });
   });
 
+  // acquireLock() throws once its own deadline passes without acquiring, so a
+  // successful return under a 500ms budget with staleMs at 30s is itself the
+  // assertion: the lock was reclaimed because its owner is gone, not because it
+  // aged out. Measuring wall-clock here instead added nothing and made the test
+  // flaky -- the deadline is only checked after a failed attempt, so one slow
+  // attempt on a loaded runner returns successfully at over 500ms.
   const startedAt = Date.now();
   const successor = await acquireLock(lockDir, {
     timeoutMs: 500,
     staleMs: 30000,
     retryDelayMs: 5
   });
-  assert.ok(Date.now() - startedAt < 500, "dead owner should be reclaimed before stale timeout");
+  assert.ok(
+    Date.now() - startedAt < 30000,
+    "reclaiming a dead owner must not wait for the stale timeout"
+  );
   releaseLock(successor);
 });
 
