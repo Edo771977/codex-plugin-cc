@@ -8,6 +8,7 @@
 - Use the built-in `:workspace` profile for scoped write tasks and require the approved read roots to cover the workspace.
 - Deny inherited system temp roots in scoped profiles so only approved directories and minimal runtime paths remain readable.
 - Reject `--read-root` together with `--sandbox danger-full-access`, which disables the sandbox entirely.
+- Treat a busy broker's shutdown refusal as a refusal rather than an identity rejection, so SessionEnd leaves the shared runtime to the sessions still using it instead of exiting with an error.
 
 ## 1.0.0
 
