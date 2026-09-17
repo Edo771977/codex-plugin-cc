@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 
 import {
+  binaryAvailable,
+  commandWithWindowsShim,
   getProcessIdentity,
   isProcessRunning,
   isProcessTreeRunning,
@@ -287,4 +289,45 @@ test("a dead group leader with a surviving descendant still counts as a running 
     }
     assert.equal(exited, true, "cleanup must confirm the test process exited");
   }
+});
+
+test("commandWithWindowsShim avoids shell:true on Windows", () => {
+  assert.deepEqual(
+    commandWithWindowsShim("codex", ["app-server"], {
+      platform: "win32",
+      comspec: "C:\\Windows\\System32\\cmd.exe"
+    }),
+    {
+      command: "C:\\Windows\\System32\\cmd.exe",
+      args: ["/d", "/s", "/c", "call", "codex", "app-server"],
+      shell: false
+    }
+  );
+});
+
+test("binaryAvailable uses cmd.exe explicitly for Windows command shims", () => {
+  let captured = null;
+  const outcome = binaryAvailable("npm", ["--version"], {
+    platform: "win32",
+    comspec: "C:\\Windows\\System32\\cmd.exe",
+    runCommandImpl(command, args, options) {
+      captured = { command, args, options };
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: "11.16.0\n",
+        stderr: "",
+        error: null
+      };
+    }
+  });
+
+  assert.deepEqual(captured, {
+    command: "C:\\Windows\\System32\\cmd.exe",
+    args: ["/d", "/s", "/c", "call", "npm", "--version"],
+    options: { cwd: undefined, env: undefined, shell: false }
+  });
+  assert.deepEqual(outcome, { available: true, detail: "11.16.0" });
 });
