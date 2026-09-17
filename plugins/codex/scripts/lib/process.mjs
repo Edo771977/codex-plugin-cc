@@ -15,6 +15,12 @@ export function runCommand(command, args = [], options = {}) {
     timeout: options.timeout,
     killSignal: options.killSignal,
     stdio: options.stdio ?? "pipe",
+    // `process.env.SHELL` is a POSIX convention with no meaning for native
+    // Windows process creation; consulting it routed commands through whatever
+    // POSIX shell happened to be set (Git Bash, which Claude Code's own Bash
+    // tool sets), and MSYS path conversion then mangled Windows-style flags
+    // like `/PID`. Nothing is spawned through a shell here; a Windows `.cmd`
+    // shim goes through commandWithWindowsShim() instead.
     shell: options.shell ?? false,
     windowsHide: true
   });

@@ -221,6 +221,9 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       cwd: this.cwd,
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
+      // See runCommand(): SHELL is a POSIX convention and is never consulted
+      // for Windows process creation. `codex` is a .cmd shim there, so the
+      // invocation above wraps it in an explicit cmd.exe call instead.
       shell: invocation.shell,
       windowsHide: true
     });

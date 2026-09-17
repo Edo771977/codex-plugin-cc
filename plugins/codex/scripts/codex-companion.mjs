@@ -43,7 +43,8 @@ import {
   reconcileJobsLiveness,
   resolveCancelableJob,
   resolveResultJob,
-  sortJobsNewestFirst
+  sortJobsNewestFirst,
+  wasCancellationConfirmed
 } from "./lib/job-control.mjs";
 import {
   appendLogLine,
@@ -1369,6 +1370,12 @@ async function handleCancel(argv) {
   const effectiveStatus = orphanAdopted
     ? readStoredJob(workspaceRoot, job.id)?.status ?? "cancelled"
     : "cancelled";
+  // Neither the turn interrupt nor the worker kill proved the job stopped:
+  // a partial `taskkill /T` on Windows can refuse a subset of the tree. The
+  // record is already written (record-first, above), so the cancellation is
+  // not rewound — but the command must not exit as though it had worked while
+  // a write-capable task may still be editing the workspace.
+  const cancellationConfirmed = wasCancellationConfirmed(interrupt, workerKillError == null);
   const payload = {
     jobId: job.id,
     status: effectiveStatus,
@@ -1377,7 +1384,8 @@ async function handleCancel(argv) {
     turnInterrupted: interrupt.interrupted,
     // A failed kill leaves the worker alive even though the record is
     // cancelled; the caller must be able to tell that from a clean cancel.
-    workerTerminated: workerKillError == null
+    workerTerminated: workerKillError == null,
+    cancellationConfirmed
   };
 
   outputCommandResult(
@@ -1385,6 +1393,13 @@ async function handleCancel(argv) {
     renderCancelReport({ ...nextJob, status: effectiveStatus }, { workerTerminated: workerKillError == null }),
     options.json
   );
+
+  if (!cancellationConfirmed) {
+    throw new Error(
+      `Could not confirm job ${job.id} stopped: the turn interrupt did not succeed and terminating the worker process tree failed. ` +
+        "The job is recorded as cancelled, but its worker may still be running — check it before relying on the workspace."
+    );
+  }
 }
 
 async function main() {

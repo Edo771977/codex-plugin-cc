@@ -180,8 +180,8 @@ test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
   const outcome = terminateProcessTree(1234, {
     platform: "win32",
-    runCommandImpl(command, args) {
-      captured = { command, args };
+    runCommandImpl(command, args, options) {
+      captured = { command, args, shell: options?.shell };
       return {
         command,
         args,
@@ -199,7 +199,11 @@ test("terminateProcessTree uses taskkill on Windows", () => {
 
   assert.deepEqual(captured, {
     command: "taskkill",
-    args: ["/PID", "1234", "/T", "/F"]
+    args: ["/PID", "1234", "/T", "/F"],
+    // Never through a shell: under Git Bash, MSYS path conversion rewrites
+    // /PID into a filesystem path and every kill fails with "Invalid
+    // argument/option", leaving background workers unkillable.
+    shell: false
   });
   assert.equal(outcome.delivered, true);
   assert.equal(outcome.method, "taskkill");
