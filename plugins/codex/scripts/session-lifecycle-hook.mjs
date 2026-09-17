@@ -4,6 +4,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { isPidAlive, terminateProcessTree } from "./lib/process.mjs";
+import { reconcileJobLiveness } from "./lib/job-control.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
   LOG_FILE_ENV,
@@ -262,6 +263,20 @@ async function cleanupSessionJobs(cwd, sessionId, { interruptTurns = false, inte
   for (const job of sessionJobs) {
     const stillRunning = job.status === "queued" || job.status === "running";
     if (!stillRunning) {
+      continue;
+    }
+    // A dead worker still gets its terminal record below — that is what keeps
+    // /codex:status from answering "No job found" for the session that just
+    // ended. Reconciliation is consulted only for the one case where writing
+    // that record would be a lie: see the retain below.
+    const reconciled = reconcileJobLiveness(job);
+    if (reconciled.workerExited && reconciled.threadId && !reconciled.turnId) {
+      // The worker died after turn/start was accepted but before it recorded a
+      // turn id, so the Codex turn may still be running and there is nothing to
+      // interrupt it by. Cancelling the record here would claim an outcome that
+      // did not happen; leave it active (its phase says why) for the next
+      // status query, which reconciles it the same way.
+      upsertJob(workspaceRoot, { id: job.id, phase: reconciled.phase, pid: null });
       continue;
     }
     jobsAwaitingInterrupt -= 1;
