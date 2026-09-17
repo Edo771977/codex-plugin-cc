@@ -66,6 +66,9 @@ say what bounds those windows and where the files are.
   - Usage will contribute to your Codex usage limits. [Learn more](https://developers.openai.com/codex/pricing).
 - **Node.js 18.18 or later.**
   - It does not have to be on the system PATH: the hooks resolve Node through `scripts/run-node.sh`, which also looks in nvm, fnm, asdf, mise, Volta and Homebrew toolchains, preferring one that ships `codex` alongside it. Set `CODEX_COMPANION_NODE` to an executable path to pin a specific one.
+- **On Windows: Git Bash** (the shell Git for Windows installs), because the hooks run `scripts/run-node.sh` through it.
+  - Nothing else is spawned through a shell. `codex` and `npm` are `.cmd` shims, so they are invoked as an explicit `cmd.exe /d /s /c call`; everything else — `git`, `taskkill`, `powershell.exe`, the background worker — is spawned directly. That matters: routing through a POSIX shell makes MSYS rewrite Windows-style switches, which is why `taskkill /PID … /T /F` used to fail and background workers could not be stopped.
+  - The shared broker listens on a named pipe rather than a Unix socket, and has no filesystem artifact to clean up.
 
 ## Install
 
@@ -457,6 +460,13 @@ Beyond the imports, this fork carries fixes for defects the imports themselves s
 - disabling the review gate is not outvoted by a stale enable left under another plugin-data root
 - `CLAUDE_ENV_FILE` is only ever appended to: it is shared with other plugins' hooks, and rewriting
   it dropped whatever they had just written
+- on Windows nothing is spawned through the user's shell any more, so MSYS path conversion can no
+  longer mangle a switch like `taskkill /PID` — which had left background workers unkillable under
+  Git Bash ([#725](https://github.com/openai/codex-plugin-cc/pull/725), which also supersedes
+  [#735](https://github.com/openai/codex-plugin-cc/pull/735))
+- `/codex:cancel` exits non-zero when neither the turn interrupt nor the worker kill confirmed the
+  job stopped, instead of reporting a cancellation nothing proved
+  ([#656](https://github.com/openai/codex-plugin-cc/pull/656))
 - the app-server typecheck (`npm run build`) passes
 
 Each of those came out of an adversarial review of the merges, re-run after every round of fixes;
