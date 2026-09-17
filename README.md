@@ -41,7 +41,8 @@ passes the token through as text.
 
 - **ChatGPT subscription (incl. Free) or OpenAI API key.**
   - Usage will contribute to your Codex usage limits. [Learn more](https://developers.openai.com/codex/pricing).
-- **Node.js 18.18 or later**
+- **Node.js 18.18 or later.**
+  - It does not have to be on the system PATH: the hooks resolve Node through `scripts/run-node.sh`, which also looks in nvm, fnm, asdf, mise, Volta and Homebrew toolchains, preferring one that ships `codex` alongside it. Set `CODEX_COMPANION_NODE` to an executable path to pin a specific one.
 
 ## Install
 
@@ -375,6 +376,10 @@ Commands and flags:
 | [#742](https://github.com/openai/codex-plugin-cc/pull/742) | `--sandbox <mode>` on `task` and `/codex:rescue` |
 | [#746](https://github.com/openai/codex-plugin-cc/pull/746) | `--model`/`--effort` on the review commands, and a warning for unrecognised options |
 | [#748](https://github.com/openai/codex-plugin-cc/pull/748) | `CLAUDE_ENV_FILE` keeps one export per key instead of growing on every session |
+| [#731](https://github.com/openai/codex-plugin-cc/pull/731) | the review-gate flag is persisted outside the transient state dir, so a different `CLAUDE_PLUGIN_DATA` no longer silently disables it |
+| [#737](https://github.com/openai/codex-plugin-cc/pull/737) | hooks resolve Node through `scripts/run-node.sh`, so nvm/fnm/asdf/mise/Volta/Homebrew toolchains work under the minimal hook PATH |
+| [#747](https://github.com/openai/codex-plugin-cc/pull/747) | `runCommand` sets an explicit 256 MiB `maxBuffer`, so a large `git diff` is no longer truncated at Node's 1 MiB default |
+| [#763](https://github.com/openai/codex-plugin-cc/pull/763) | a turn that fails without throwing stores its error text, so `/codex:result` says why it failed |
 
 Where two of these PRs disagreed, the merge commit says which side won and why. The plugin version
 is deliberately left at the upstream number: these merges do not cut a release.

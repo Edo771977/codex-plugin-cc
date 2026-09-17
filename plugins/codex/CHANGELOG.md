@@ -9,6 +9,10 @@
 - Deny inherited system temp roots in scoped profiles so only approved directories and minimal runtime paths remain readable.
 - Reject `--read-root` together with `--sandbox danger-full-access`, which disables the sandbox entirely.
 - Treat a busy broker's shutdown refusal as a refusal rather than an identity rejection, so SessionEnd leaves the shared runtime to the sessions still using it instead of exiting with an error.
+- Set an explicit 256 MiB `maxBuffer` for spawned commands so a large `git diff` is no longer truncated at Node's 1 MiB default.
+- Persist the failure text of a turn that fails without throwing, and shorten job summaries to 96 characters.
+- Keep the review-gate flag in a durable per-workspace file under `CODEX_HOME`, written privately and atomically.
+- Resolve Node through `scripts/run-node.sh` in the hooks, preferring a user-managed toolchain over a system install.
 
 ## 1.0.0
 
