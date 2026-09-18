@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { isPidAlive, terminateProcessTree } from "./lib/process.mjs";
+import { forceKillProcessTree, isPidAlive, terminateProcessTree } from "./lib/process.mjs";
 import { reconcileJobLiveness } from "./lib/job-control.mjs";
 import { brokerIdleShutdownMs } from "./lib/lifecycle-limits.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
@@ -50,15 +50,9 @@ async function waitForWorkerExits(pids) {
     return [];
   }
   for (const pid of stragglers) {
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        // Ignore missing process.
-      }
-    }
+    // Not `process.kill(-pid)`: on Windows that is an invalid handle rather than a process group,
+    // and falling back to the bare pid would leave the worker's app-server subtree behind.
+    forceKillProcessTree(pid);
   }
   // Give the forced kill a beat to release the sockets.
   await new Promise((resolve) => setTimeout(resolve, 100));

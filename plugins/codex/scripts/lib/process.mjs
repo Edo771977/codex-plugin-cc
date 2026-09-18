@@ -15,7 +15,13 @@ export function runCommand(command, args = [], options = {}) {
     timeout: options.timeout,
     killSignal: options.killSignal,
     stdio: options.stdio ?? "pipe",
-    shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
+    // `process.env.SHELL` is a POSIX convention with no meaning for native
+    // Windows process creation; consulting it routed commands through whatever
+    // POSIX shell happened to be set (Git Bash, which Claude Code's own Bash
+    // tool sets), and MSYS path conversion then mangled Windows-style flags
+    // like `/PID`. Nothing is spawned through a shell here; a Windows `.cmd`
+    // shim goes through commandWithWindowsShim() instead.
+    shell: options.shell ?? false,
     windowsHide: true
   });
 
@@ -43,8 +49,33 @@ export function runCommandChecked(command, args = [], options = {}) {
   return result;
 }
 
+export function commandWithWindowsShim(command, args = [], options = {}) {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "win32") {
+    return { command, args, shell: false };
+  }
+
+  return {
+    command: options.comspec ?? process.env.ComSpec ?? "cmd.exe",
+    args: ["/d", "/s", "/c", "call", command, ...args],
+    shell: false
+  };
+}
+
 export function binaryAvailable(command, versionArgs = ["--version"], options = {}) {
-  const result = runCommand(command, versionArgs, options);
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  let result;
+
+  if (options.shell !== undefined) {
+    result = runCommandImpl(command, versionArgs, options);
+  } else {
+    const invocation = commandWithWindowsShim(command, versionArgs, options);
+    result = runCommandImpl(invocation.command, invocation.args, {
+      cwd: options.cwd,
+      env: options.env,
+      shell: invocation.shell
+    });
+  }
   if (result.error && /** @type {NodeJS.ErrnoException} */ (result.error).code === "ENOENT") {
     return { available: false, detail: "not found" };
   }
@@ -390,6 +421,52 @@ export function processHasLaunchToken(pid, token, options = {}) {
 }
 
 /**
+ * Force-kill a process and everything under it, for callers that have already tried a graceful stop.
+ *
+ * POSIX has a harder signal to escalate to, and the process group addresses the descendants:
+ * SIGKILL the group, falling back to the process alone for a caller that never was a group leader.
+ *
+ * Windows has neither. There are no process groups — a negative pid is just an invalid handle, so
+ * `process.kill(-pid)` throws ESRCH and a naive catch-and-retry silently degrades to killing the
+ * direct process while its descendants (the app-server, and every MCP server under it) keep
+ * running. taskkill's own tree walk is the only way to reach them, and `/F` is already the hardest
+ * stop there is, so the Windows branch is the same call as the graceful one.
+ */
+/**
+ * @param {number} pid
+ * @param {{ platform?: string, killImpl?: Function, runCommandImpl?: Function }} [options]
+ * @returns {{ attempted: boolean, delivered: boolean, method: string | null }}
+ */
+export function forceKillProcessTree(pid, options = {}) {
+  if (!isValidPid(pid)) {
+    return { attempted: false, delivered: false, method: null };
+  }
+
+  if ((options.platform ?? process.platform) === "win32") {
+    try {
+      const outcome = terminateProcessTree(pid, options);
+      return { attempted: outcome.attempted, delivered: outcome.delivered, method: outcome.method };
+    } catch {
+      // Teardown is best effort: a taskkill that fails outright must not throw at the caller.
+      return { attempted: true, delivered: false, method: "taskkill" };
+    }
+  }
+
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+  try {
+    killImpl(-pid, "SIGKILL");
+    return { attempted: true, delivered: true, method: "process-group" };
+  } catch {
+    try {
+      killImpl(pid, "SIGKILL");
+      return { attempted: true, delivered: true, method: "process" };
+    } catch {
+      return { attempted: true, delivered: false, method: "process" };
+    }
+  }
+}
+
+/**
  * Terminate a process tree and make sure it is actually gone.
  *
  * `terminateProcessTree` sends SIGTERM and stops there, so a descendant that traps or ignores it
@@ -419,11 +496,9 @@ export function terminateProcessTreeAndExit(pid, { graceMs = 5000, exitCode = 1,
     } catch {
       // Never let bookkeeping stop the kill.
     }
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch {
-      // Nothing left in the group, or the caller was never its leader.
-    }
+    // Nothing left in the group, a caller that was never its leader, or a Windows tree that
+    // taskkill could not reach: none of them may stop us from exiting.
+    forceKillProcessTree(pid);
     process.exit(exitCode);
   }, graceMs);
 }
@@ -440,7 +515,8 @@ export function terminateProcessTree(pid, options = {}) {
   if (platform === "win32") {
     const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
-      env: options.env
+      env: options.env,
+      shell: false
     });
 
     if (!result.error && result.status === 0) {
@@ -448,7 +524,7 @@ export function terminateProcessTree(pid, options = {}) {
     }
 
     const combinedOutput = `${result.stderr}\n${result.stdout}`.trim();
-    if (!result.error && looksLikeMissingProcessMessage(combinedOutput)) {
+    if (!result.error && (result.status === 128 || looksLikeMissingProcessMessage(combinedOutput))) {
       return { attempted: true, delivered: false, method: "taskkill", result };
     }
 

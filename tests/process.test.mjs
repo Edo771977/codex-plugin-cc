@@ -1,9 +1,15 @@
+import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import {
+  binaryAvailable,
+  commandWithWindowsShim,
+  forceKillProcessTree,
   getProcessIdentity,
   isProcessRunning,
   isProcessTreeRunning,
@@ -13,6 +19,8 @@ import {
   terminateProcessTree,
   waitForProcessExit
 } from "../plugins/codex/scripts/lib/process.mjs";
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const SELF_TERMINATING_SCRIPT = "process.kill(process.pid, 'SIGTERM'); setInterval(() => {}, 1000);";
 
@@ -178,8 +186,8 @@ test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
   const outcome = terminateProcessTree(1234, {
     platform: "win32",
-    runCommandImpl(command, args) {
-      captured = { command, args };
+    runCommandImpl(command, args, options) {
+      captured = { command, args, shell: options?.shell };
       return {
         command,
         args,
@@ -197,7 +205,11 @@ test("terminateProcessTree uses taskkill on Windows", () => {
 
   assert.deepEqual(captured, {
     command: "taskkill",
-    args: ["/PID", "1234", "/T", "/F"]
+    args: ["/PID", "1234", "/T", "/F"],
+    // Never through a shell: under Git Bash, MSYS path conversion rewrites
+    // /PID into a filesystem path and every kill fails with "Invalid
+    // argument/option", leaving background workers unkillable.
+    shell: false
   });
   assert.equal(outcome.delivered, true);
   assert.equal(outcome.method, "taskkill");
@@ -287,4 +299,163 @@ test("a dead group leader with a surviving descendant still counts as a running 
     }
     assert.equal(exited, true, "cleanup must confirm the test process exited");
   }
+});
+
+test("commandWithWindowsShim avoids shell:true on Windows", () => {
+  assert.deepEqual(
+    commandWithWindowsShim("codex", ["app-server"], {
+      platform: "win32",
+      comspec: "C:\\Windows\\System32\\cmd.exe"
+    }),
+    {
+      command: "C:\\Windows\\System32\\cmd.exe",
+      args: ["/d", "/s", "/c", "call", "codex", "app-server"],
+      shell: false
+    }
+  );
+});
+
+test("binaryAvailable uses cmd.exe explicitly for Windows command shims", () => {
+  let captured = null;
+  const outcome = binaryAvailable("npm", ["--version"], {
+    platform: "win32",
+    comspec: "C:\\Windows\\System32\\cmd.exe",
+    runCommandImpl(command, args, options) {
+      captured = { command, args, options };
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: "11.16.0\n",
+        stderr: "",
+        error: null
+      };
+    }
+  });
+
+  assert.deepEqual(captured, {
+    command: "C:\\Windows\\System32\\cmd.exe",
+    args: ["/d", "/s", "/c", "call", "npm", "--version"],
+    options: { cwd: undefined, env: undefined, shell: false }
+  });
+  assert.deepEqual(outcome, { available: true, detail: "11.16.0" });
+});
+
+test("forceKillProcessTree reaches descendants on Windows instead of signalling a negative pid", () => {
+  let captured = null;
+  const outcome = forceKillProcessTree(1234, {
+    platform: "win32",
+    runCommandImpl(command, args, options) {
+      captured = { command, args, shell: options?.shell };
+      return { command, args, status: 0, signal: null, stdout: "", stderr: "", error: null };
+    },
+    killImpl(pid) {
+      // Windows has no process groups: OpenProcess on a negative pid fails, so a
+      // catch-and-retry would degrade to killing the worker alone and orphan the
+      // app-server (and every MCP server) underneath it.
+      throw new Error(`process.kill must not be used on Windows (called with ${pid})`);
+    }
+  });
+
+  assert.deepEqual(captured, {
+    command: "taskkill",
+    args: ["/PID", "1234", "/T", "/F"],
+    shell: false
+  });
+  assert.deepEqual(outcome, { attempted: true, delivered: true, method: "taskkill" });
+});
+
+test("forceKillProcessTree never throws when the Windows tree cannot be reached", () => {
+  const outcome = forceKillProcessTree(1234, {
+    platform: "win32",
+    runCommandImpl(command, args) {
+      return {
+        command,
+        args,
+        status: 1,
+        signal: null,
+        stdout: "",
+        stderr: "ERROR: Access is denied.",
+        error: null
+      };
+    }
+  });
+
+  assert.deepEqual(outcome, { attempted: true, delivered: false, method: "taskkill" });
+});
+
+test("forceKillProcessTree SIGKILLs the process group on POSIX", () => {
+  const signalled = [];
+  const outcome = forceKillProcessTree(1234, {
+    platform: "linux",
+    killImpl(pid, signal) {
+      signalled.push({ pid, signal });
+    }
+  });
+
+  assert.deepEqual(signalled, [{ pid: -1234, signal: "SIGKILL" }]);
+  assert.equal(outcome.method, "process-group");
+  assert.equal(outcome.delivered, true);
+});
+
+test("forceKillProcessTree falls back to the process when it leads no group", () => {
+  const signalled = [];
+  const outcome = forceKillProcessTree(1234, {
+    platform: "linux",
+    killImpl(pid, signal) {
+      signalled.push({ pid, signal });
+      if (pid < 0) {
+        const error = new Error("No such process");
+        error.code = "ESRCH";
+        throw error;
+      }
+    }
+  });
+
+  assert.deepEqual(signalled, [
+    { pid: -1234, signal: "SIGKILL" },
+    { pid: 1234, signal: "SIGKILL" }
+  ]);
+  assert.equal(outcome.method, "process");
+  assert.equal(outcome.delivered, true);
+});
+
+test("no plugin script force-kills through a negative pid outside the platform-guarded helpers", () => {
+  // `kill(-pid, …)` addresses a process group, which exists only on POSIX; on Windows it is
+  // an invalid handle, and a catch-and-retry on the bare pid silently orphans the descendants.
+  // So a direct `process.kill(-pid)` is banned outright: group signalling belongs to the
+  // platform-guarded helpers in process.mjs, which send it through an injectable `killImpl`
+  // and pick taskkill on Windows.
+  const scriptsDir = path.join(ROOT, "plugins", "codex", "scripts");
+  const direct = new Set();
+  const viaKillImpl = new Set();
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!entry.name.endsWith(".mjs")) {
+        continue;
+      }
+      const relative = path.relative(ROOT, full).split(path.sep).join("/");
+      for (const line of fs.readFileSync(full, "utf8").split("\n")) {
+        const code = line.trim();
+        if (code.startsWith("//") || code.startsWith("*") || code.startsWith("/*")) {
+          continue;
+        }
+        if (/\bprocess\.kill\(\s*-/.test(code)) {
+          direct.add(relative);
+        } else if (/\bkill\w*\(\s*-/.test(code)) {
+          viaKillImpl.add(relative);
+        }
+      }
+    }
+  };
+  walk(scriptsDir);
+
+  assert.deepEqual([...direct], []);
+  assert.deepEqual([...viaKillImpl], ["plugins/codex/scripts/lib/process.mjs"]);
 });
