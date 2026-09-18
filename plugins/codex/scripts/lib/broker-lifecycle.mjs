@@ -18,7 +18,6 @@ import {
 import { withLock } from "./locking.mjs";
 import {
   getProcessIdentity,
-  isPidAlive,
   isProcessRunning,
   isProcessTreeRunning,
   isValidPid,
@@ -75,19 +74,32 @@ function probeEndpoint(endpoint, timeoutMs) {
   });
 }
 
-async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
+/**
+ * Retry probeEndpoint() until the deadline, reporting how the last attempt ended.
+ *
+ * The outcome matters to the caller that has to decide what a silent endpoint means: "nothing is
+ * there" (ECONNREFUSED, ENOENT) and "something is there but would not take this connection right
+ * now" (a timeout, EAGAIN from a full accept backlog, EBUSY from a Windows named pipe with no free
+ * instance) are the same boolean and opposite situations.
+ */
+async function probeBrokerEndpoint(endpoint, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
+  let outcome = "timeout";
   while (Date.now() < deadline) {
-    const probe = await probeEndpoint(endpoint, Math.min(150, deadline - Date.now()));
-    if (probe === "connect") {
-      return true;
+    outcome = await probeEndpoint(endpoint, Math.min(150, deadline - Date.now()));
+    if (outcome === "connect") {
+      return { ready: true, outcome };
     }
-    if (probe === "invalid") {
-      return false;
+    if (outcome === "invalid") {
+      return { ready: false, outcome };
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  return false;
+  return { ready: false, outcome };
+}
+
+async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
+  return (await probeBrokerEndpoint(endpoint, timeoutMs)).ready;
 }
 
 export async function sendBrokerShutdown(endpoint, options = {}) {
@@ -654,25 +666,61 @@ function withBrokerLock(cwd, options, action) {
   );
 }
 
+// How long a broker that is listening but refusing connections gets to start accepting again.
+//
+// Only the outcomes in BUSY_ENDPOINT_OUTCOMES buy this wait. A connect() to a Unix socket is
+// completed by the kernel as soon as the peer is listening — the server does not have to call
+// accept() — so a broker that is merely mid-turn answers the fast probe in microseconds and never
+// reaches here. What does reach here is an endpoint that is present and refusing: a full accept
+// backlog (EAGAIN), or a Windows named pipe with no free instance (EBUSY, ERROR_PIPE_BUSY), where
+// spawning a replacement would start a second app-server, and every MCP server under it, for a
+// broker that is about to be available again.
+const BUSY_BROKER_PROBE_TIMEOUT_MS = 1500;
+
+// "Listening, but not taking this connection right now." Everything else a probe can report —
+// ECONNREFUSED, ENOENT, an unparsable endpoint — means nothing is there to wait for, and waiting
+// on it would make the common case (a broker that is really gone) pay for the rare one.
+const BUSY_ENDPOINT_OUTCOMES = new Set(["timeout", "EAGAIN", "EBUSY"]);
+
 async function ensureBrokerSessionLocked(cwd, options = {}) {
   const shutdownOptions = {
     ...options,
     killProcess: options.killProcess ?? terminateProcessTree
   };
+  const probe = options.probeBrokerEndpoint ?? probeBrokerEndpoint;
   const existing = loadBrokerSession(cwd);
-  if (existing?.endpoint && (await waitForBrokerEndpoint(existing.endpoint, 150))) {
+  const fastProbe = existing?.endpoint
+    ? await probe(existing.endpoint, 150)
+    : { ready: false, outcome: "invalid" };
+  if (fastProbe.ready) {
     return existing;
   }
 
-  // Only reclaim a broker we can prove is gone. The probe above waits 150ms, which a live but busy
-  // broker can miss, and forcing a shutdown here on that alone would kill (or orphan) a broker that
-  // another, unrelated session is still using — the ownership-verified teardown below can force a
-  // kill once `options.killProcess` is set, so this gate keeps that path from firing on a broker
-  // that only failed to answer within 150ms.
+  // Pinned to the identity recorded at spawn time, like the shutdown path: a reused pid must read
+  // as gone rather than keep an abandoned record alive.
+  const existingIsAlive = existing
+    ? isProcessRunning(existing.pid, { identity: existing.processIdentity ?? undefined })
+    : false;
+
+  // Refusing, not gone: give it the longer window. Answering there means it is the workspace's
+  // broker and back in service, so it is reused as it stands.
+  if (
+    existingIsAlive &&
+    BUSY_ENDPOINT_OUTCOMES.has(fastProbe.outcome) &&
+    (await probe(existing.endpoint, options.busyProbeTimeoutMs ?? BUSY_BROKER_PROBE_TIMEOUT_MS)).ready
+  ) {
+    return existing;
+  }
+
+  // Only reclaim a broker we can prove is gone. The probes above prove nothing about the process —
+  // a wedged broker stays silent through both — and forcing a shutdown on that alone would kill (or
+  // orphan) a broker that another, unrelated session is still using; the ownership-verified teardown
+  // below can force a kill once `options.killProcess` is set, so this gate keeps that path from
+  // firing on a broker that merely failed to answer.
   //
-  // A live one is left exactly as it is. Once the replacement below takes over it has no clients,
-  // so its own idle shutdown reclaims both the process and its files.
-  if (existing && !isPidAlive(existing.pid)) {
+  // A live one that stayed silent is left exactly as it is, and replaced. Once the replacement below
+  // takes over it has no clients, so its own idle shutdown reclaims both the process and its files.
+  if (existing && !existingIsAlive) {
     await shutdownBrokerSessionLocked(cwd, shutdownOptions);
   }
 

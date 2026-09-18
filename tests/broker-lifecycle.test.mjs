@@ -1297,3 +1297,162 @@ test("clearBrokerSession deletes the same record loadBrokerSession() returned, n
     assert.equal(loadBrokerSession(workspace), null);
   });
 });
+
+// A broker script that records the fact it was launched. Spawning it at all means the
+// workspace's existing broker was written off and replaced. It is written outside any broker
+// session dir so production teardown can still rmdir that dir.
+function writeSpawnMarkerBroker() {
+  // Not a cxc-* name: that prefix is what resolveOwnedSessionDir() reads as a broker session dir.
+  const dir = makeTempDir("marker-broker-");
+  const scriptPath = path.join(dir, "marker-broker.mjs");
+  const markerPath = path.join(dir, "spawned.marker");
+  fs.writeFileSync(
+    scriptPath,
+    [
+      'import fs from "node:fs";',
+      `fs.appendFileSync(${JSON.stringify(markerPath)}, "spawned\\n");`,
+      "setTimeout(() => {}, 60000);"
+    ].join("\n")
+  );
+  return { scriptPath, spawned: () => fs.existsSync(markerPath) };
+}
+
+async function waitUntil(predicate, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return predicate();
+}
+
+// The probe outcome decides everything here, and the outcomes worth deciding on cannot be produced
+// on demand from a test: a Unix connect() succeeds the moment the peer listens, so "listening but
+// refusing" needs a saturated accept backlog, and EBUSY needs a Windows named pipe. Injecting the
+// probe keeps these tests about the decision, which is what changed.
+function scriptedProbe(outcomes) {
+  const calls = [];
+  const probe = async (endpoint, timeoutMs) => {
+    calls.push({ endpoint, timeoutMs });
+    const next = outcomes[calls.length - 1] ?? { ready: false, outcome: "ECONNREFUSED" };
+    return next;
+  };
+  return { probe, calls };
+}
+
+function recordedSession(sessionDir, { pid, endpoint }) {
+  return {
+    endpoint: endpoint ?? `unix:${path.join(sessionDir, "broker.sock")}`,
+    pid,
+    pidFile: null,
+    logFile: null,
+    sessionDir,
+    instanceToken: "probe-outcome-token"
+  };
+}
+
+test("a live broker that is refusing connections is given the longer window and reused", async () => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-refusing-");
+  const session = recordedSession(sessionDir, { pid: process.pid });
+  saveBrokerSession(workspace, session);
+
+  // EAGAIN is what a full accept backlog reports: the broker is there and will take the next
+  // connection, so replacing it would start a second app-server for nothing.
+  const { probe, calls } = scriptedProbe([
+    { ready: false, outcome: "EAGAIN" },
+    { ready: true, outcome: "connect" }
+  ]);
+  const marker = writeSpawnMarkerBroker();
+  const result = await ensureBrokerSession(workspace, {
+    scriptPath: marker.scriptPath,
+    probeBrokerEndpoint: probe
+  });
+
+  assert.equal(result?.endpoint, session.endpoint, "the refusing broker must be handed back");
+  assert.equal(marker.spawned(), false, "it must not be replaced by a second broker");
+  assert.deepEqual(loadBrokerSession(workspace), session, "its persisted session must be untouched");
+  assert.equal(calls.length, 2, "the longer window must be entered exactly once");
+  assert.deepEqual(
+    calls.map((call) => call.timeoutMs),
+    [150, 1500],
+    "the fast probe's budget, then the shipped default for the longer one"
+  );
+});
+
+test("a broker that is simply gone never pays for the longer window", async () => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-gone-");
+  // Alive pid, nothing listening: the broker's own graceful shutdown closes its listener seconds
+  // before the process exits, and a record can outlive its socket. Waiting on that would charge
+  // the common case for the rare one.
+  const session = recordedSession(sessionDir, { pid: process.pid });
+  saveBrokerSession(workspace, session);
+
+  const { probe, calls } = scriptedProbe([{ ready: false, outcome: "ECONNREFUSED" }]);
+  const marker = writeSpawnMarkerBroker();
+  await ensureBrokerSession(workspace, {
+    scriptPath: marker.scriptPath,
+    probeBrokerEndpoint: probe,
+    timeoutMs: 300
+  }).catch(() => {});
+
+  assert.equal(calls.length, 1, "ECONNREFUSED must not buy a second probe");
+  assert.equal(await waitUntil(() => marker.spawned()), true, "the gone broker must be replaced");
+});
+
+test("a broker that keeps refusing through the longer window is replaced", async () => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-wedged-");
+  const session = recordedSession(sessionDir, { pid: process.pid });
+  saveBrokerSession(workspace, session);
+
+  // Wedged rather than momentarily busy. Handing this one back would block every later command
+  // behind it, so the replacement must still run once the longer window has had its say.
+  const { probe, calls } = scriptedProbe([
+    { ready: false, outcome: "timeout" },
+    { ready: false, outcome: "timeout" }
+  ]);
+  const marker = writeSpawnMarkerBroker();
+  await ensureBrokerSession(workspace, {
+    scriptPath: marker.scriptPath,
+    probeBrokerEndpoint: probe,
+    busyProbeTimeoutMs: 300,
+    timeoutMs: 300
+  }).catch(() => {});
+
+  assert.equal(calls.length, 2, "the longer window must have been tried");
+  assert.equal(await waitUntil(() => marker.spawned()), true, "a broker that stays silent must be replaced");
+});
+
+test("a dead broker's record is reclaimed rather than waited on", { skip: process.platform === "win32" }, async () => {
+  const workspace = makeTempDir();
+  const sessionDir = makeTempDir("cxc-dead-");
+  const socketPath = path.join(sessionDir, "broker.sock");
+
+  // A real dead broker: the socket file it left behind is still on disk, its pid is not.
+  const holder = await spawnSocketHolder(socketPath);
+  const deadPid = holder.pid;
+  holder.kill("SIGKILL");
+  await new Promise((resolve) => holder.once("exit", resolve));
+
+  const session = recordedSession(sessionDir, { pid: deadPid });
+  saveBrokerSession(workspace, session);
+
+  // A timeout is the one outcome that would buy the longer window from a live broker, so this is
+  // where the liveness gate has to do the work: the pid is gone, and waiting on a dead broker's
+  // endpoint delays the replacement for nothing.
+  const { probe, calls } = scriptedProbe([{ ready: false, outcome: "timeout" }]);
+  const marker = writeSpawnMarkerBroker();
+  await ensureBrokerSession(workspace, {
+    scriptPath: marker.scriptPath,
+    probeBrokerEndpoint: probe,
+    timeoutMs: 300,
+    killProcess: () => {}
+  }).catch(() => {});
+
+  assert.equal(calls.length, 1, "a dead broker must not buy a second probe");
+  assert.equal(await waitUntil(() => marker.spawned()), true, "it must be replaced");
+});
