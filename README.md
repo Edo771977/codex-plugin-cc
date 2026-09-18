@@ -467,6 +467,14 @@ Beyond the imports, this fork carries fixes for defects the imports themselves s
   every MCP server under it — running. `taskkill /T /F` walks the tree there instead
 - a state write that Windows briefly refuses — a scanner or indexer holding the file open, which
   surfaces as `EPERM`/`EBUSY` on the replacing rename — is retried instead of losing the record
+- a live broker that is *refusing* connections — a full accept backlog, or a Windows named pipe
+  with no free instance — is given a longer window to start accepting again and reused if it does,
+  instead of being replaced by a second broker with its own app-server and MCP servers. A broker
+  that is simply gone still costs nothing: only the probe outcomes that mean "listening, but not
+  right now" buy that wait ([#768](https://github.com/openai/codex-plugin-cc/pull/768) raises the
+  duplicate-broker problem upstream; its own two fixes — never tearing down a live broker, and
+  serializing the check-then-create window — were already here, and its blanket 3s probe is not
+  taken, since it would charge every gone broker for the rare busy one)
 - the app-server typecheck (`npm run build`) passes
 
 Each of those came out of an adversarial review of the merges, re-run after every round of fixes;

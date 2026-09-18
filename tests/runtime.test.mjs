@@ -3991,7 +3991,12 @@ test("a hung turn interrupt cannot starve later jobs' interrupt attempts", async
     cwd: repo,
     env: {
       ...process.env,
-      CODEX_COMPANION_APP_SERVER_ENDPOINT: `unix:${socketPath}`
+      CODEX_COMPANION_APP_SERVER_ENDPOINT: `unix:${socketPath}`,
+      // What is under test is that the budget is *shared*, not how large it is: the hung
+      // interrupt consumes its whole slice, so with the 2200ms default a loaded machine can
+      // spend the remainder before the second job is ever attempted, and the test reports a
+      // starvation that did not happen. The slicing is identical at any budget.
+      CODEX_TURN_INTERRUPT_BUDGET_MS: "8000"
     },
     input: JSON.stringify({
       hook_event_name: "SessionEnd",
@@ -4139,7 +4144,12 @@ test("a hung dead-worker reap interrupt cannot starve the session's own interrup
     cwd: repo,
     env: {
       ...process.env,
-      CODEX_COMPANION_APP_SERVER_ENDPOINT: `unix:${socketPath}`
+      CODEX_COMPANION_APP_SERVER_ENDPOINT: `unix:${socketPath}`,
+      // What is under test is that the budget is *shared*, not how large it is: the hung
+      // interrupt consumes its whole slice, so with the 2200ms default a loaded machine can
+      // spend the remainder before the second job is ever attempted, and the test reports a
+      // starvation that did not happen. The slicing is identical at any budget.
+      CODEX_TURN_INTERRUPT_BUDGET_MS: "8000"
     },
     input: JSON.stringify({
       hook_event_name: "SessionEnd",
