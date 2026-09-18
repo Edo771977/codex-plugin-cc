@@ -741,7 +741,7 @@ test("broker rejects an explicit unsubscribe that would queue behind a hung clea
 });
 
 test("broker rolls back child threads inherited through a failed provisional claim", async (t) => {
-  const broker = startBroker("with-delayed-subagent");
+  const broker = startBroker("with-resume-inherited-subagent");
   t.after(() => broker.stop());
   assert.equal(await broker.listening(), true, `broker never listened: ${broker.stderr()}`);
 
@@ -754,8 +754,9 @@ test("broker rolls back child threads inherited through a failed provisional cla
   firstClient.destroy();
   await waitForUnsubscribes(broker.statePath, [threadId]);
 
-  // The resume fails after 250 ms; the delayed child arrives at 100 ms while the
-  // claim is still open, so the claiming socket inherits it.
+  // The child, and the grandchild under it, arrive while this resume's claim is open, and
+  // the resume fails only after both — a chain the fixture drives off the resume itself, so
+  // no part of it depends on how fast this client got here.
   const secondClient = await connectClient(broker.socketPath);
   await assert.rejects(
     secondClient.request("thread/resume", { threadId, persistFullHistory: true }),
