@@ -3,6 +3,7 @@ import process from "node:process";
 const DEFAULT_BROKER_IDLE_SHUTDOWN_MS = 10 * 60 * 1000;
 const DEFAULT_BROKER_STARTUP_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_WORKER_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_TURN_INTERRUPT_BUDGET_MS = 2200;
 
 /** `setTimeout` truncates anything larger to a 32-bit int, firing almost immediately instead. */
 const MAX_TIMEOUT_MS = 2 ** 31 - 1;
@@ -65,6 +66,18 @@ export function brokerIdleShutdownMs(env = process.env) {
  */
 export function brokerStartupTimeoutMs(env = process.env) {
   return readDurationMs(env.CODEX_BROKER_STARTUP_TIMEOUT_MS, DEFAULT_BROKER_STARTUP_TIMEOUT_MS);
+}
+
+/**
+ * How long a SessionEnd hook run may spend interrupting turns, in total.
+ *
+ * The reaper's dead-turn interrupts and the session's own share this one budget so they cannot
+ * stack past the hook timeout, and each job gets a slice of what is left. The default suits a
+ * handful of jobs on a responsive machine; a workspace with many active jobs, or a loaded machine
+ * where each attempt takes longer, may need more. `0` disables turn interrupts entirely.
+ */
+export function turnInterruptBudgetMs(env = process.env) {
+  return readDurationMs(env.CODEX_TURN_INTERRUPT_BUDGET_MS, DEFAULT_TURN_INTERRUPT_BUDGET_MS);
 }
 
 /**

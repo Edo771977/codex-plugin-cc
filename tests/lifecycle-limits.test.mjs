@@ -6,6 +6,7 @@ import {
   brokerIdleShutdownMs,
   brokerStartupTimeoutMs,
   disarmTimeout,
+  turnInterruptBudgetMs,
   workerTtlMs
 } from "../plugins/codex/scripts/lib/lifecycle-limits.mjs";
 import { isPidAlive } from "../plugins/codex/scripts/lib/process.mjs";
@@ -50,6 +51,22 @@ test("worker ttl honours an override and can be disabled", () => {
 test("worker ttl falls back to the default on unusable input", () => {
   for (const raw of ["soon", "-5", "NaN", "  "]) {
     assert.equal(workerTtlMs({ CODEX_TASK_WORKER_TTL_MS: raw }), ONE_DAY);
+  }
+});
+
+test("turn interrupt budget defaults to 2200ms", () => {
+  assert.equal(turnInterruptBudgetMs({}), 2200);
+  assert.equal(turnInterruptBudgetMs({ CODEX_TURN_INTERRUPT_BUDGET_MS: "" }), 2200);
+});
+
+test("turn interrupt budget honours an override and can be disabled", () => {
+  assert.equal(turnInterruptBudgetMs({ CODEX_TURN_INTERRUPT_BUDGET_MS: "8000" }), 8000);
+  assert.equal(turnInterruptBudgetMs({ CODEX_TURN_INTERRUPT_BUDGET_MS: "0" }), 0);
+});
+
+test("turn interrupt budget falls back to the default on unusable input", () => {
+  for (const raw of ["soon", "-5", "NaN", "  "]) {
+    assert.equal(turnInterruptBudgetMs({ CODEX_TURN_INTERRUPT_BUDGET_MS: raw }), 2200);
   }
 });
 

@@ -5,7 +5,7 @@ import process from "node:process";
 
 import { forceKillProcessTree, isPidAlive, terminateProcessTree } from "./lib/process.mjs";
 import { reconcileJobLiveness } from "./lib/job-control.mjs";
-import { brokerIdleShutdownMs } from "./lib/lifecycle-limits.mjs";
+import { brokerIdleShutdownMs, turnInterruptBudgetMs } from "./lib/lifecycle-limits.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
   LOG_FILE_ENV,
@@ -28,7 +28,7 @@ const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 // (identity waits are capped per job and reserve room for the interrupt
 // RPCs themselves), then a short exit grace for killed workers, then the
 // shutdown exchange with its one retry.
-const TURN_INTERRUPT_BUDGET_MS = 2200;
+const TURN_INTERRUPT_BUDGET_MS = turnInterruptBudgetMs();
 const TURN_IDENTITY_WAIT_MS = 500;
 const TURN_INTERRUPT_RESERVE_MS = 1000;
 

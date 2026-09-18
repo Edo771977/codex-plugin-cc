@@ -214,7 +214,9 @@ test("shutdown request always uses a finite deadline", { skip: process.platform 
   const sessionDir = makeTempDir("cxc-unresponsive-");
   const socketPath = path.join(sessionDir, "broker.sock");
   const sockets = new Set();
+  let accepted = false;
   const server = net.createServer((socket) => {
+    accepted = true;
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
     socket.on("data", () => {
@@ -229,24 +231,37 @@ test("shutdown request always uses a finite deadline", { skip: process.platform 
     await new Promise((resolve) => server.close(resolve));
   });
 
-  for (const timeoutMs of [0, 40]) {
-    const startedAt = Date.now();
-    const response = await sendBrokerShutdown(`unix:${socketPath}`, {
-      instanceToken: "instance-token-1234567890",
-      timeoutMs
-    });
-    // A broker that accepts the connection and then says nothing is ambiguous:
-    // it may be alive and busy with its refusal lost on the wire. The outcome
-    // has to report that — not delivered, not refused, and deliberately not
-    // unreachable — so teardown never reaps a broker that may still be serving
-    // someone.
-    assert.equal(response.delivered, false);
-    assert.equal(response.refused, false);
-    assert.equal(response.unreachable, false);
-    assert.equal(response.result, null);
-    assert.equal(response.error, null);
-    assert.ok(Date.now() - startedAt < 500, "shutdown request exceeded its deadline");
-  }
+  // `timeoutMs: 0` is the case that has to settle at all: socket.setTimeout(0) disables the timer
+  // outright, so without the clamp inside sendBrokerShutdown() this call would wait on a silent
+  // peer forever. Racing it against a watchdog states exactly that, and fails in seconds instead
+  // of hanging the suite. The watchdog is deliberately far longer than the work: what is under
+  // test is finite versus infinite, not fast versus slow.
+  let watchdog;
+  const settled = await Promise.race([
+    sendBrokerShutdown(`unix:${socketPath}`, { instanceToken: "instance-token-1234567890", timeoutMs: 0 }),
+    new Promise((resolve) => {
+      watchdog = setTimeout(() => resolve("never settled"), 30000);
+    })
+  ]);
+  clearTimeout(watchdog);
+  assert.notEqual(settled, "never settled", "a zero timeout must not become no timeout");
+
+  // A broker that accepts the connection and then says nothing is ambiguous: it may be alive and
+  // busy with its refusal lost on the wire. The outcome has to report that — not delivered, not
+  // refused, and deliberately not unreachable — so teardown never reaps a broker that may still be
+  // serving someone. The budget here is generous on purpose: with a 1ms deadline the connect
+  // itself loses the race on a loaded machine, and `unreachable` then reports the truth about a
+  // scenario the test never managed to set up.
+  const response = await sendBrokerShutdown(`unix:${socketPath}`, {
+    instanceToken: "instance-token-1234567890",
+    timeoutMs: 1000
+  });
+  assert.equal(accepted, true, "the server never accepted the connection this case is about");
+  assert.equal(response.delivered, false);
+  assert.equal(response.refused, false);
+  assert.equal(response.unreachable, false);
+  assert.equal(response.result, null);
+  assert.equal(response.error, null);
   assert.equal(fs.existsSync(socketPath), true);
 });
 
