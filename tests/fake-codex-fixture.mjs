@@ -372,6 +372,38 @@ rl.on("line", (line) => {
         if (BEHAVIOR === "permission-profiles-unsupported" && message.params.config) {
           throw new Error("unknown field config.default_permissions");
         }
+        if (BEHAVIOR === "with-resume-inherited-subagent" && message.params.persistFullHistory === true) {
+          // A causal chain, not a stopwatch: the child arrives while THIS resume's claim is
+          // open, the grandchild under it, and only then does the resume fail. Hanging any of
+          // it off turn/start instead made the test depend on the client getting from
+          // turn/start to resume inside 100ms, which a loaded runner does not promise.
+          const parentThread = ensureThread(state, message.params.threadId);
+          setTimeout(() => {
+            const childState = loadState();
+            const child = nextThread(childState, parentThread.cwd, true, parentThread.sandbox, { parentThreadId: parentThread.id });
+            const childRecord = ensureThread(childState, child.id);
+            childRecord.name = "delayed-design-challenger";
+            childState.subscriptions = [...new Set([...(childState.subscriptions || []), child.id])];
+            saveState(childState);
+            const childTurnId = nextTurnId(childState);
+            send({ method: "thread/started", params: { thread: { ...buildThread(childRecord), name: childRecord.name, agentNickname: childRecord.name } } });
+            send({ method: "turn/started", params: { threadId: child.id, turn: buildTurn(childTurnId) } });
+            send({ method: "turn/completed", params: { threadId: child.id, turn: buildTurn(childTurnId, "completed") } });
+            setTimeout(() => {
+              const nestedState = loadState();
+              const grandchild = nextThread(nestedState, parentThread.cwd, true, parentThread.sandbox, { parentThreadId: child.id });
+              const grandchildRecord = ensureThread(nestedState, grandchild.id);
+              grandchildRecord.name = "delayed-design-grandchild";
+              nestedState.subscriptions = [...new Set([...(nestedState.subscriptions || []), grandchild.id])];
+              saveState(nestedState);
+              send({ method: "thread/started", params: { thread: { ...buildThread(grandchildRecord), name: grandchildRecord.name, agentNickname: grandchildRecord.name } } });
+              setTimeout(() => {
+                send({ id: message.id, error: { code: -32000, message: "forced resume failure after child arrival" } });
+              }, 50);
+            }, 50);
+          }, 50);
+          break;
+        }
         if (BEHAVIOR === "with-delayed-subagent" && message.params.persistFullHistory === true) {
           state.nestedSubagentRequested = true;
           saveState(state);
