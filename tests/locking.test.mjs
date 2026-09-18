@@ -142,8 +142,13 @@ test("stale legacy lock without process identity does not follow a reused PID fo
   const oldTime = new Date(Date.now() - 60000);
   fs.utimesSync(lockDir, oldTime, oldTime);
 
+  // Returning at all is the assertion, as above: with staleMs at 30s, a successor can only
+  // exist because the legacy lock was reclaimed on the spot. The budget is deliberately far
+  // wider than the work needs -- acquireLockSync() checks its deadline after a failed attempt,
+  // so under a loaded runner a single stalled attempt used to expire a 200ms budget in the
+  // moment between the reclaim and the retry that would have succeeded.
   const successor = acquireLockSync(lockDir, {
-    timeoutMs: 200,
+    timeoutMs: 5000,
     staleMs: 30000,
     retryDelayMs: 5,
     isProcessRunning: () => true
