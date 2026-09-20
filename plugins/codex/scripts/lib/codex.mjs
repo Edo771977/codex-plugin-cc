@@ -350,7 +350,10 @@ function describeStartedItem(state, item) {
         phase: looksLikeVerificationCommand(item.command) ? "verifying" : "running"
       };
     case "fileChange":
-      return { message: `Applying ${item.changes.length} file change(s).`, phase: "editing" };
+      return {
+        message: `Applying ${Array.isArray(item.changes) ? item.changes.length : 0} file change(s).`,
+        phase: "editing"
+      };
     case "mcpToolCall":
       return { message: `Calling ${item.server}/${item.tool}.`, phase: "investigating" };
     case "dynamicToolCall":
@@ -753,7 +756,8 @@ async function withAppServer(cwd, fn) {
     const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
     const shouldRetryDirect =
       (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
-      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
+      (brokerRequested &&
+        (error?.code === "ENOENT" || error?.code === "ECONNREFUSED" || error?.code === "ETIMEDOUT"));
 
     if (client) {
       await client.close().catch(() => {});

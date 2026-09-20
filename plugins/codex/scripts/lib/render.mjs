@@ -374,8 +374,13 @@ export function renderStatusReport(report) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderJobStatusReport(job) {
+export function renderJobStatusReport(job, options = {}) {
   const lines = ["# Codex Job Status", ""];
+  if (options.waitTimedOut) {
+    const timeoutSeconds = Math.max(1, Math.round((Number(options.timeoutMs) || 0) / 1000));
+    lines.push(`Timed out after ${timeoutSeconds}s while the job was still ${job.status || "active"}.`);
+    lines.push("");
+  }
   pushJobDetails(lines, job, {
     showElapsed: job.status === "queued" || job.status === "running",
     showDuration: job.status !== "queued" && job.status !== "running",
