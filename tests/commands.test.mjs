@@ -256,6 +256,27 @@ test("hooks keep session-end cleanup and stop gating enabled", () => {
   assert.match(source, /session-lifecycle-hook\.mjs/);
 });
 
+test("stop-review task timeout leaves headroom under the Stop hook timeout", () => {
+  const hookSource = read("scripts/stop-review-gate-hook.mjs");
+  const hooks = JSON.parse(read("hooks/hooks.json"));
+  const stopHook = hooks.hooks.Stop.flatMap((entry) => entry.hooks).find((hook) =>
+    String(hook.command ?? "").includes("stop-review-gate-hook.mjs")
+  );
+  const hookTimeoutMs = Number(stopHook?.timeout) * 1000;
+  const timeoutMatch = hookSource.match(/const STOP_REVIEW_TIMEOUT_MS = ([^;]+);/);
+  assert.ok(timeoutMatch, "STOP_REVIEW_TIMEOUT_MS should be declared");
+  assert.match(timeoutMatch[1], /^[\d\s.*+\-/()]+$/);
+  const innerTimeoutMs = new Function(`return (${timeoutMatch[1]});`)();
+  const timeoutMessageMatch = hookSource.match(/timed out after ([0-9]+) minutes/);
+
+  assert.equal(Number.isFinite(hookTimeoutMs), true);
+  assert.equal(hookTimeoutMs, 900000);
+  assert.equal(Number.isFinite(innerTimeoutMs), true);
+  assert.equal(innerTimeoutMs < hookTimeoutMs, true);
+  assert.equal(hookTimeoutMs - innerTimeoutMs >= 30000, true);
+  assert.equal(Number(timeoutMessageMatch?.[1]) * 60 * 1000, innerTimeoutMs);
+});
+
 test("setup command can offer Codex install and still points users to codex login", () => {
   const setup = read("commands/setup.md");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
