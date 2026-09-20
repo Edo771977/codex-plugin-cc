@@ -248,7 +248,10 @@ function describeStartedItem(state, item) {
         phase: looksLikeVerificationCommand(item.command) ? "verifying" : "running"
       };
     case "fileChange":
-      return { message: `Applying ${item.changes.length} file change(s).`, phase: "editing" };
+      return {
+        message: `Applying ${Array.isArray(item.changes) ? item.changes.length : 0} file change(s).`,
+        phase: "editing"
+      };
     case "mcpToolCall":
       return { message: `Calling ${item.server}/${item.tool}.`, phase: "investigating" };
     case "dynamicToolCall":
