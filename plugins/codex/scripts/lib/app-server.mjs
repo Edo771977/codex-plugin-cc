@@ -334,6 +334,23 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 }
 
+/**
+ * How long a client waits for the broker's socket to accept it before giving up.
+ *
+ * Without a bound this connect waits forever on an endpoint that never completes — a wedged
+ * broker, or a named pipe whose server is not accepting — and takes the command with it. The
+ * timeout is short because it is not a patience budget: a broker that is merely refusing is
+ * handled a level up, in ensureBrokerSession(), which waits for it to start accepting rather than
+ * replacing it. Reaching this timer means the endpoint never answered at all, and `withAppServer`
+ * then falls back to a direct app-server rather than leaving the caller stuck.
+ */
+export const BROKER_CONNECT_TIMEOUT_MS = 2000;
+
+export function resolveBrokerConnectTimeoutMs(options = {}) {
+  const requested = Number(options.connectTimeoutMs);
+  return Number.isFinite(requested) && requested > 0 ? requested : BROKER_CONNECT_TIMEOUT_MS;
+}
+
 class BrokerCodexAppServerClient extends AppServerClientBase {
   constructor(cwd, options = {}) {
     super(cwd, options);
@@ -344,16 +361,44 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
   async initialize() {
     await new Promise((resolve, reject) => {
       const target = parseBrokerEndpoint(this.endpoint);
-      this.socket = net.createConnection({ path: target.path });
+      const createConnection = this.options.createConnection ?? ((path) => net.createConnection({ path }));
+      this.socket = createConnection(target.path);
       this.socket.setEncoding("utf8");
-      this.socket.on("connect", resolve);
+      // One settle path, so the deadline timer cannot outlive the attempt: a timer left armed
+      // after the connect resolved or failed holds the event loop open for its whole budget,
+      // which on a short-lived command is the difference between exiting now and exiting in 2s.
+      let timer = null;
+      let settled = false;
+      const settle = (action) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        action();
+      };
+      timer = setTimeout(() => {
+        settle(() => {
+          this.socket.destroy();
+          reject(
+            Object.assign(new Error("Timed out connecting to the Codex app-server broker."), {
+              code: "ETIMEDOUT"
+            })
+          );
+        });
+      }, resolveBrokerConnectTimeoutMs(this.options));
+      this.socket.on("connect", () => settle(resolve));
       this.socket.on("data", (chunk) => {
         this.handleChunk(chunk);
       });
       this.socket.on("error", (error) => {
-        if (!this.exitResolved) {
-          reject(error);
-        }
+        settle(() => {
+          if (!this.exitResolved) {
+            reject(error);
+          }
+        });
+        // Reported whether or not this attempt had already settled: an error after connect is
+        // the transport dying, which the client's exit bookkeeping still has to see.
         this.handleExit(error);
       });
       this.socket.on("close", () => {
