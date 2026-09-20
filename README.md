@@ -423,6 +423,10 @@ Broker and background-job lifecycle:
 | [#725](https://github.com/openai/codex-plugin-cc/pull/725) | nothing is spawned through the user's shell on Windows, where MSYS path conversion mangled switches like `taskkill /PID` and left background workers unkillable under Git Bash (this supersedes [#735](https://github.com/openai/codex-plugin-cc/pull/735)) |
 | [#656](https://github.com/openai/codex-plugin-cc/pull/656) | `/codex:cancel` exits non-zero when neither the turn interrupt nor the worker kill confirmed the job stopped, instead of reporting a cancellation nothing proved |
 | [#770](https://github.com/openai/codex-plugin-cc/pull/770) | `npm run build` works on Windows: npm runs scripts through cmd.exe, where `mkdir -p` made a stray `-p` directory and then failed every build after the first |
+| [#775](https://github.com/openai/codex-plugin-cc/pull/775) | a `fileChange` start event without its change list no longer throws and aborts the turn |
+| [#772](https://github.com/openai/codex-plugin-cc/pull/772) | the stop-review gate keeps a minute of headroom under the Stop hook's budget, so a timed-out review can still say so instead of ending the turn silently |
+| [#774](https://github.com/openai/codex-plugin-cc/pull/774) | `status --wait` prints its timeout and exits non-zero, instead of looking like a finished status check |
+| [#773](https://github.com/openai/codex-plugin-cc/pull/773) | a broker connect that never completes is given up on after 2s and falls back to a direct app-server (the probe half of that PR is not taken: ours already bounds each attempt *and* reports why it failed) |
 
 Commands and flags:
 
