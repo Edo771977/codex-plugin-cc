@@ -23,11 +23,12 @@ import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 
-// The SessionEnd hook runs under a 5-second timeout (hooks.json). The
-// budgets below must sum comfortably under it: brokered turn interrupts
-// (identity waits are capped per job and reserve room for the interrupt
-// RPCs themselves), then a short exit grace for killed workers, then the
-// shutdown exchange with its one retry.
+// The SessionEnd hook runs under a 30-second timeout (hooks.json; SessionStart is the 5-second
+// one). The budgets below must sum comfortably under it: brokered turn interrupts (identity waits
+// are capped per job and reserve room for the interrupt RPCs themselves), then a short exit grace
+// for killed workers, then the shutdown exchange with its one retry. The default interrupt budget
+// is deliberately far below the hook timeout — the hook must return long before Claude Code stops
+// waiting — and CODEX_TURN_INTERRUPT_BUDGET_MS raises it for a workspace with many active jobs.
 const TURN_INTERRUPT_BUDGET_MS = turnInterruptBudgetMs();
 const TURN_IDENTITY_WAIT_MS = 500;
 const TURN_INTERRUPT_RESERVE_MS = 1000;

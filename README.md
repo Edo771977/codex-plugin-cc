@@ -422,6 +422,7 @@ Broker and background-job lifecycle:
 | [#728](https://github.com/openai/codex-plugin-cc/pull/728) | a job whose worker died no longer reads as "running" forever; `/codex:status` reconciles the record against the live process |
 | [#725](https://github.com/openai/codex-plugin-cc/pull/725) | nothing is spawned through the user's shell on Windows, where MSYS path conversion mangled switches like `taskkill /PID` and left background workers unkillable under Git Bash (this supersedes [#735](https://github.com/openai/codex-plugin-cc/pull/735)) |
 | [#656](https://github.com/openai/codex-plugin-cc/pull/656) | `/codex:cancel` exits non-zero when neither the turn interrupt nor the worker kill confirmed the job stopped, instead of reporting a cancellation nothing proved |
+| [#770](https://github.com/openai/codex-plugin-cc/pull/770) | `npm run build` works on Windows: npm runs scripts through cmd.exe, where `mkdir -p` made a stray `-p` directory and then failed every build after the first |
 
 Commands and flags:
 
