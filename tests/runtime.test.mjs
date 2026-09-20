@@ -2117,11 +2117,68 @@ test("status --wait times out cleanly when a job is still active", () => {
     cwd: workspace
   });
 
-  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.status > 0, true, result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.job.id, "task-live");
   assert.equal(payload.job.status, "running");
   assert.equal(payload.waitTimedOut, true);
+});
+
+test("status --wait reports a timeout in text output when the job is still active", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const logFile = path.join(jobsDir, "task-live.log");
+  fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Starting Codex Task.\n", "utf8");
+  fs.writeFileSync(
+    path.join(jobsDir, "task-live.json"),
+    JSON.stringify(
+      {
+        id: "task-live",
+        status: "running",
+        title: "Codex Task",
+        logFile
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-live",
+            status: "running",
+            title: "Codex Task",
+            jobClass: "task",
+            summary: "Investigate flaky test",
+            logFile,
+            createdAt: "2026-03-18T15:30:00.000Z",
+            startedAt: "2026-03-18T15:30:01.000Z",
+            updatedAt: "2026-03-18T15:30:02.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "status", "task-live", "--wait", "--timeout-ms", "25"], {
+    cwd: workspace
+  });
+
+  assert.match(result.stdout, /Timed out after \d+s while the job was still running/i);
+  assert.equal(result.status > 0, true);
 });
 
 test("result returns the stored output for the latest finished job by default", () => {
