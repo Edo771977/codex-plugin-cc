@@ -54,6 +54,15 @@ function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
 }
 
+function isProcessAlive(pid, killImpl) {
+  try {
+    killImpl(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
 export function terminateProcessTree(pid, options = {}) {
   if (!Number.isFinite(pid)) {
     return { attempted: false, delivered: false, method: null };
@@ -76,6 +85,13 @@ export function terminateProcessTree(pid, options = {}) {
     const combinedOutput = `${result.stderr}\n${result.stdout}`.trim();
     if (!result.error && looksLikeMissingProcessMessage(combinedOutput)) {
       return { attempted: true, delivered: false, method: "taskkill", result };
+    }
+
+    // taskkill /T walks the tree, then terminates each entry; a descendant that exits in
+    // between (short-lived git/cmd helpers) makes taskkill report "not supported" and a
+    // non-zero status even though the root was killed. Trust the root's liveness instead.
+    if (!result.error && !isProcessAlive(pid, killImpl)) {
+      return { attempted: true, delivered: true, method: "taskkill", result };
     }
 
     if (result.error?.code === "ENOENT") {

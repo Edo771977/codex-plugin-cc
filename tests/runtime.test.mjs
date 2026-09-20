@@ -47,7 +47,11 @@ test("setup reports ready when fake codex is installed and authenticated", () =>
 test("setup is ready without npm when Codex is already installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
-  fs.symlinkSync(process.execPath, path.join(binDir, "node"));
+  if (process.platform === "win32") {
+    fs.writeFileSync(path.join(binDir, "node.cmd"), `@echo off\r\n"${process.execPath}" %*\r\n`, "utf8");
+  } else {
+    fs.symlinkSync(process.execPath, path.join(binDir, "node"));
+  }
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
     cwd: ROOT,
@@ -220,6 +224,7 @@ test("transfer delegates the current Claude session directly to native import", 
     env: {
       ...buildEnv(binDir),
       HOME: home,
+      USERPROFILE: home,
       CODEX_HOME: path.join(home, ".codex"),
       CODEX_COMPANION_TRANSCRIPT_PATH: sourcePath
     }
@@ -265,6 +270,7 @@ test("transfer reports an actionable upgrade error when native import is unsuppo
     env: {
       ...buildEnv(binDir),
       HOME: home,
+      USERPROFILE: home,
       CODEX_HOME: path.join(home, ".codex")
     }
   });
@@ -295,6 +301,7 @@ test("transfer fails visibly when native import completes without a ledger recor
     env: {
       ...buildEnv(binDir),
       HOME: home,
+      USERPROFILE: home,
       CODEX_HOME: path.join(home, ".codex")
     }
   });
@@ -320,7 +327,7 @@ test("transfer rejects sources outside the Claude projects directory", () => {
 
   const result = run("node", [SCRIPT, "transfer", "--source", sourcePath], {
     cwd: repo,
-    env: { ...buildEnv(binDir), HOME: home }
+    env: { ...buildEnv(binDir), HOME: home, USERPROFILE: home }
   });
 
   assert.notEqual(result.status, 0);
