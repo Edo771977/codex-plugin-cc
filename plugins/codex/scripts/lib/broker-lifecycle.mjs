@@ -24,18 +24,49 @@ function connectToEndpoint(endpoint) {
 export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
+    const remainingMs = timeoutMs - (Date.now() - start);
+    if (remainingMs <= 0) {
+      break;
+    }
     const ready = await new Promise((resolve) => {
+      let settled = false;
+      const finish = (value) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resolve(value);
+      };
+
       const socket = connectToEndpoint(endpoint);
-      socket.on("connect", () => {
-        socket.end();
-        resolve(true);
-      });
-      socket.on("error", () => resolve(false));
+      const attemptTimeoutMs = Math.max(1, Math.min(100, remainingMs));
+      const timer = setTimeout(() => {
+        socket.destroy();
+        finish(false);
+      }, attemptTimeoutMs);
+
+      const onDone = (value) => {
+        clearTimeout(timer);
+        if (value) {
+          socket.end();
+        } else {
+          socket.destroy();
+        }
+        finish(value);
+      };
+
+      socket.setTimeout(attemptTimeoutMs, () => onDone(false));
+      socket.on("connect", () => onDone(true));
+      socket.on("error", () => onDone(false));
     });
     if (ready) {
       return true;
     }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    const waitMs = Math.min(50, Math.max(0, timeoutMs - (Date.now() - start)));
+    if (waitMs <= 0) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
   }
   return false;
 }

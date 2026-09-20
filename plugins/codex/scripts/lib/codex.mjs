@@ -621,7 +621,8 @@ async function withAppServer(cwd, fn) {
     const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
     const shouldRetryDirect =
       (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
-      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
+      (brokerRequested &&
+        (error?.code === "ENOENT" || error?.code === "ECONNREFUSED" || error?.code === "ETIMEDOUT"));
 
     if (client) {
       await client.close().catch(() => {});

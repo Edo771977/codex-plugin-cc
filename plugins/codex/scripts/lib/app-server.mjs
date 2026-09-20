@@ -287,11 +287,23 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
       const target = parseBrokerEndpoint(this.endpoint);
       this.socket = net.createConnection({ path: target.path });
       this.socket.setEncoding("utf8");
-      this.socket.on("connect", resolve);
+      const timeoutMs = this.options.connectTimeoutMs ?? 2000;
+      const timer = setTimeout(() => {
+        const error = Object.assign(new Error("Timed out connecting to the Codex app-server broker."), {
+          code: "ETIMEDOUT"
+        });
+        this.socket.destroy();
+        reject(error);
+      }, timeoutMs);
+      this.socket.on("connect", () => {
+        clearTimeout(timer);
+        resolve();
+      });
       this.socket.on("data", (chunk) => {
         this.handleChunk(chunk);
       });
       this.socket.on("error", (error) => {
+        clearTimeout(timer);
         if (!this.exitResolved) {
           reject(error);
         }
