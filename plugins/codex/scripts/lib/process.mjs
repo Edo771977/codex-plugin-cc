@@ -50,10 +50,6 @@ export function binaryAvailable(command, versionArgs = ["--version"], options = 
   return { available: true, detail: result.stdout.trim() || result.stderr.trim() || "ok" };
 }
 
-function looksLikeMissingProcessMessage(text) {
-  return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
-}
-
 function isProcessAlive(pid, killImpl) {
   try {
     killImpl(pid, 0);
@@ -73,6 +69,12 @@ export function terminateProcessTree(pid, options = {}) {
   const killImpl = options.killImpl ?? process.kill.bind(process);
 
   if (platform === "win32") {
+    // Probe the root before calling taskkill instead of parsing its localized "not found"
+    // message: a root that is already gone is reported as not delivered in every language.
+    if (!isProcessAlive(pid, killImpl)) {
+      return { attempted: false, delivered: false, method: null };
+    }
+
     const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
       env: options.env
@@ -82,14 +84,11 @@ export function terminateProcessTree(pid, options = {}) {
       return { attempted: true, delivered: true, method: "taskkill", result };
     }
 
-    const combinedOutput = `${result.stderr}\n${result.stdout}`.trim();
-    if (!result.error && looksLikeMissingProcessMessage(combinedOutput)) {
-      return { attempted: true, delivered: false, method: "taskkill", result };
-    }
-
     // taskkill /T walks the tree, then terminates each entry; a descendant that exits in
     // between (short-lived git/cmd helpers) makes taskkill report "not supported" and a
     // non-zero status even though the root was killed. Trust the root's liveness instead.
+    // `delivered` therefore describes the root only: like the process-group SIGTERM on
+    // other platforms, it does not prove that every descendant is gone.
     if (!result.error && !isProcessAlive(pid, killImpl)) {
       return { attempted: true, delivered: true, method: "taskkill", result };
     }
