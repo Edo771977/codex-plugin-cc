@@ -90,7 +90,8 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--sandbox <read-only|workspace-write|danger-full-access>] [--read-root <directory> ...] [--resume-last|--resume|--resume-thread <id>|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--ephemeral] [--sandbox <read-only|workspace-write|danger-full-access>] [--read-root <directory> ...] [--resume-last|--resume|--resume-thread <id>|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "    --ephemeral: run without persisting the Codex thread. Ephemeral tasks cannot be resumed and do not appear in Codex Recent. Cannot be combined with --resume/--resume-last/--resume-thread.",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -368,6 +369,7 @@ function findLatestResumableTaskJob(jobs) {
       (job) =>
         job.jobClass === "task" &&
         job.threadId &&
+        !job.ephemeral &&
         job.status !== "queued" &&
         job.status !== "running"
     ) ?? null
@@ -547,6 +549,7 @@ async function executeTaskRun(request) {
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last / --resume-thread <id>.");
   }
 
+  const persistThread = resumeThreadId ? true : !request.ephemeral;
   const result = await runAppServerTurn(workspaceRoot, {
     resumeThreadId,
     prompt: request.prompt,
@@ -557,8 +560,8 @@ async function executeTaskRun(request) {
     readRoots: request.readRoots,
     write: request.write,
     onProgress: request.onProgress,
-    persistThread: true,
-    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
+    persistThread,
+    threadName: persistThread ? buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT) : null
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
@@ -597,7 +600,8 @@ async function executeTaskRun(request) {
     errorMessage: failureMessage || null,
     jobTitle: taskMetadata.title,
     jobClass: "task",
-    write: Boolean(request.write)
+    write: Boolean(request.write),
+    ephemeral: !persistThread
   };
 }
 
@@ -673,7 +677,19 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, sandbox, readRoots, resumeLast, resumeThread = null, jobId }) {
+function buildTaskRequest({
+  cwd,
+  model,
+  effort,
+  prompt,
+  write,
+  sandbox,
+  readRoots,
+  resumeLast,
+  resumeThread = null,
+  jobId,
+  ephemeral
+}) {
   return {
     cwd,
     model,
@@ -684,7 +700,8 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, sandbox, readRoot
     readRoots,
     resumeLast,
     resumeThread,
-    jobId
+    jobId,
+    ephemeral: Boolean(ephemeral)
   };
 }
 
@@ -879,7 +896,7 @@ async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file", "sandbox", "resume-thread"],
     multiValueOptions: ["read-root"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "ephemeral"],
     leadingOnlyOptions: ["sandbox"],
     aliasMap: {
       m: "model"
@@ -915,6 +932,14 @@ async function handleTask(argv) {
       "--write requires an approved --read-root that covers the workspace directory; the same applies to --sandbox workspace-write."
     );
   }
+  const ephemeral = Boolean(options.ephemeral);
+  // This fork also has --resume-thread, which resumes by id: an ephemeral thread is never
+  // persisted, so there is nothing for either form of resume to come back to.
+  if (ephemeral && (resumeLast || resumeThread)) {
+    throw new Error(
+      "--ephemeral cannot be combined with --resume/--resume-last/--resume-thread. Ephemeral tasks are not persisted and cannot be resumed."
+    );
+  }
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast: resumeLast || Boolean(resumeThread)
@@ -935,7 +960,8 @@ async function handleTask(argv) {
       readRoots,
       resumeLast,
       resumeThread,
-      jobId: job.id
+      jobId: job.id,
+      ephemeral
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
@@ -957,6 +983,7 @@ async function handleTask(argv) {
         resumeLast,
         resumeThread,
         jobId: job.id,
+        ephemeral,
         onProgress: progress
       }),
     { json: options.json }

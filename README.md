@@ -26,7 +26,7 @@ they already have.
 | --- | --- | --- |
 | [`/codex:review`](#codexreview) | read-only Codex review of your current work | `--wait`, `--background`, `--base <ref>`, `--scope <auto\|working-tree\|branch>`, `--model <model\|spark>`, `--effort <level>` |
 | [`/codex:adversarial-review`](#codexadversarial-review) | steerable review that challenges the approach | same as `/codex:review`, plus free-form focus text |
-| [`/codex:rescue`](#codexrescue) | delegate investigation or a fix to Codex | `--background`, `--wait`, `--resume`, `--resume-thread <id>`, `--fresh`, `--model`, `--effort`, `--write`, `--sandbox <mode>`, `--read-root <dir>` |
+| [`/codex:rescue`](#codexrescue) | delegate investigation or a fix to Codex | `--background`, `--wait`, `--resume`, `--resume-thread <id>`, `--fresh`, `--ephemeral`, `--model`, `--effort`, `--write`, `--sandbox <mode>`, `--read-root <dir>` |
 | [`/codex:transfer`](#codextransfer) | turn this Claude session into a resumable Codex thread | `--source <claude-jsonl>` |
 | [`/codex:status`](#codexstatus) | show active and recent Codex jobs | `[job-id]`, `--wait`, `--timeout-ms <ms>`, `--all` |
 | [`/codex:result`](#codexresult) | show the stored output of a finished job | `[job-id]` |
@@ -192,7 +192,7 @@ Use it when you want Codex to:
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, `--resume-thread <id>`, `--fresh`, `--model <model|spark>`, `--effort <level>`, `--write`, `--sandbox <read-only|workspace-write|danger-full-access>`, and repeatable `--read-root <directory>`. If you omit the resume flags, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--resume`, `--resume-thread <id>`, `--fresh`, `--ephemeral`, `--model <model|spark>`, `--effort <level>`, `--write`, `--sandbox <read-only|workspace-write|danger-full-access>`, and repeatable `--read-root <directory>`. If you omit the resume flags, the plugin can offer to continue the latest rescue thread for this repo.
 
 Examples:
 
@@ -221,6 +221,7 @@ Ask Codex to redesign the database connection to be more resilient.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
 - `--resume`/`--resume-last` continues the newest thread for this repository; `--resume-thread <id>` continues one specific thread (the id is printed by `/codex:status` and `/codex:result`). `--resume`, `--resume-thread`, and `--fresh` are mutually exclusive.
+- `--ephemeral` runs without persisting the Codex thread: nothing is added to Codex's Recent list, and there is no thread to come back to. Useful for disposable, fire-and-forget work — many parallel subtasks from an orchestrating agent, say — where the persistent threads are only noise. It is refused together with `--resume`, `--resume-last` and `--resume-thread`, an ephemeral run is never offered as a `--resume-last` candidate, and `/codex:status` and `/codex:result` stop printing a `codex resume` line for it. Without the flag nothing changes: threads persist exactly as before.
 - `--sandbox` applies to `/codex:rescue` only; the review commands stay read-only. It takes precedence over `--write` and counts only before the task text. Rescue runs edit files inside the repository by default (`workspace-write`); `read-only` blocks edits, and `danger-full-access` disables the Codex sandbox entirely, so Codex can write outside the repository and use the network without asking. Reserve it for tasks the sandbox blocks.
 - a resumed thread keeps the sandbox it was started with while the plugin's shared app-server still holds it, which is the normal case inside one Claude Code session (Codex CLI 0.153.2 applies a new mode only when it loads the thread again from disk). `task` refuses a resume whose sandbox differs from what the app-server reports; resume with the same `--sandbox`, or start a new thread with `--fresh`.
 - each `--read-root <directory>` must name an existing directory and opts into an OS-enforced permission profile that denies local command reads outside the listed directories and Codex's minimal runtime paths
@@ -428,6 +429,7 @@ Broker and background-job lifecycle:
 | [#774](https://github.com/openai/codex-plugin-cc/pull/774) | `status --wait` prints its timeout and exits non-zero, instead of looking like a finished status check |
 | [#773](https://github.com/openai/codex-plugin-cc/pull/773) | a broker connect that never completes is given up on after 2s and falls back to a direct app-server (the probe half of that PR is not taken: ours already bounds each attempt *and* reports why it failed) |
 | [#776](https://github.com/openai/codex-plugin-cc/pull/776) | Windows teardown decides on the root's liveness instead of taskkill's message: a process already gone costs no `taskkill` at all, and a `taskkill` that reports failure only because a short-lived descendant exited mid-walk no longer throws at the caller (its broker-endpoint and shutdown-timeout changes are not taken — one is a no-op here, the other is behind what this fork already does) |
+| [#779](https://github.com/openai/codex-plugin-cc/pull/779) | `--ephemeral` on `task`, so a disposable run does not leave a persistent Codex thread behind (extended here to refuse this fork's `--resume-thread` as well) |
 
 Commands and flags:
 

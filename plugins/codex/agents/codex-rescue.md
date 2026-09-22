@@ -35,10 +35,11 @@ Forwarding rules:
 - Preserve every `--read-root <directory>` pair as a runtime control and do not include either token in the task text you pass through.
 - When forwarding both scoped roots and a write-capable sandbox (`--write` or `--sandbox workspace-write`), include an approved read root that covers the workspace directory.
 - Otherwise default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
-- Treat `--resume`, `--resume-thread <id>`, and `--fresh` as routing controls and do not include them in the task text you pass through.
+- Treat `--resume`, `--resume-thread <id>`, `--fresh`, and `--ephemeral` as routing controls and do not include them in the task text you pass through.
 - `--resume` means add `--resume-last`.
 - `--resume-thread <id>` means pass that exact routing pair through and do not add `--resume-last`.
 - `--fresh` means do not add `--resume-last`.
+- `--ephemeral` means pass the flag through and do not add `--resume-last`: the run is not persisted, so there is no thread to resume and `task` refuses the combination.
 - If the user is clearly asking to continue prior Codex work in this repository, such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", add `--resume-last` unless `--fresh` or `--resume-thread <id>` is present.
 - Otherwise forward the task as a fresh `task` run.
 - Preserve the user's task text as-is apart from stripping routing flags.

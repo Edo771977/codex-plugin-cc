@@ -138,7 +138,13 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /--resume-thread <id>/);
   assert.match(agent, /Preserve every `--read-root <directory>`/i);
   assert.match(agent, /thin forwarding wrapper/i);
-  assert.match(agent, /Treat `--resume`, `--resume-thread <id>`, and `--fresh` as routing controls/i);
+  assert.match(
+    agent,
+    /Treat `--resume`, `--resume-thread <id>`, `--fresh`, and `--ephemeral` as routing controls/i
+  );
+  // The flag is worthless to anyone who only ever types /codex:rescue unless the wrapper forwards
+  // it, so the contract is asserted on both sides.
+  assert.match(agent, /`--ephemeral` means pass the flag through and do not add `--resume-last`/i);
   assert.match(agent, /`--resume-thread <id>` means pass that exact routing pair through and do not add `--resume-last`/i);
   assert.match(agent, /prefer foreground for a small, clearly bounded rescue request/i);
   assert.match(agent, /If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Codex running for a long time, prefer background execution/i);
