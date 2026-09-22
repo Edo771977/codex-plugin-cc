@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
-argument-hint: "[--background|--wait] [--resume|--resume-thread <id>|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--sandbox <read-only|workspace-write|danger-full-access>] [--read-root <directory> ...] [what Codex should investigate, solve, or continue]"
+argument-hint: "[--background|--wait] [--resume|--resume-thread <id>|--fresh|--ephemeral] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--sandbox <read-only|workspace-write|danger-full-access>] [--read-root <directory> ...] [what Codex should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -24,6 +24,7 @@ Execution mode:
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.
 - If the request includes `--fresh`, do not ask whether to continue. The user already chose.
 - If the request includes `--resume-thread <id>`, do not ask whether to continue. The user already chose the exact Codex thread.
+- If the request includes `--ephemeral`, do not ask whether to continue: an ephemeral run cannot resume anything. Preserve the flag for the forwarded `task` call and keep it out of the natural-language task text.
 - Otherwise, before starting Codex, check for a resumable rescue thread from this Claude session by running:
 
 ```bash
