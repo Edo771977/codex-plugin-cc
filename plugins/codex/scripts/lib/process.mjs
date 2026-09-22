@@ -105,8 +105,24 @@ export function isPidAlive(pid, killImpl = process.kill.bind(process)) {
   }
 }
 
-function looksLikeMissingProcessMessage(text) {
-  return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
+/**
+ * Whether a pid is *provably* gone, as opposed to merely unreadable.
+ *
+ * Deliberately narrower than !isPidAlive(): only ESRCH proves absence. Any other failure — EPERM,
+ * or whatever code a platform reports for a handle it will not open — leaves the question open,
+ * and the teardown below must still try to kill, because skipping the kill on a live root leaks
+ * its whole tree.
+ */
+function isProvablyGone(pid, killImpl) {
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return true;
+  }
+  try {
+    killImpl(pid, 0);
+    return false;
+  } catch (error) {
+    return /** @type {NodeJS.ErrnoException} */ (error)?.code === "ESRCH";
+  }
 }
 
 export function isValidPid(pid) {
@@ -513,6 +529,13 @@ export function terminateProcessTree(pid, options = {}) {
   const killImpl = options.killImpl ?? process.kill.bind(process);
 
   if (platform === "win32") {
+    // Probe the root before spawning taskkill at all, rather than parsing its localized "not
+    // found" message afterwards: a root that is provably gone is reported the same way in every
+    // system language.
+    if (isProvablyGone(pid, killImpl)) {
+      return { attempted: false, delivered: false, method: null };
+    }
+
     const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
       env: options.env,
@@ -523,9 +546,14 @@ export function terminateProcessTree(pid, options = {}) {
       return { attempted: true, delivered: true, method: "taskkill", result };
     }
 
-    const combinedOutput = `${result.stderr}\n${result.stdout}`.trim();
-    if (!result.error && (result.status === 128 || looksLikeMissingProcessMessage(combinedOutput))) {
-      return { attempted: true, delivered: false, method: "taskkill", result };
+    // A non-zero status: taskkill /T walks the tree and then terminates each entry, so a
+    // descendant that exits in between — a short-lived git or cmd helper — makes it report a
+    // failure although the root did die. The root's own liveness is the fact; its message is not,
+    // and matching that message only ever worked in English. `delivered` therefore describes the
+    // root only, exactly like the process-group SIGTERM on other platforms: it does not prove
+    // that every descendant is gone.
+    if (!result.error && isProvablyGone(pid, killImpl)) {
+      return { attempted: true, delivered: true, method: "taskkill", result };
     }
 
     if (result.error?.code === "ENOENT") {
