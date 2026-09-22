@@ -503,6 +503,133 @@ test("task --resume-last resumes the latest persisted task thread", () => {
   assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
 });
 
+test("task --ephemeral runs without persisting a Codex thread", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--ephemeral", "disposable check"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.threads.length, 1);
+  assert.equal(fakeState.threads[0].ephemeral, true);
+  assert.equal(
+    fakeState.threads.filter((thread) => !thread.ephemeral).length,
+    0,
+    "an ephemeral task must not create a persistent (Recent-visible) thread"
+  );
+});
+
+test("task without --ephemeral still persists a Codex thread (unchanged default)", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "conversational check"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.threads.length, 1);
+  assert.equal(fakeState.threads[0].ephemeral, false);
+});
+
+test("repeated task --ephemeral runs stay independent and create zero persistent threads", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  for (let i = 0; i < 3; i += 1) {
+    const result = run("node", [SCRIPT, "task", "--ephemeral", `disposable check ${i}`], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Handled the requested task/);
+  }
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.threads.length, 3);
+  assert.equal(fakeState.threads.every((thread) => thread.ephemeral), true);
+  assert.equal(
+    fakeState.threads.filter((thread) => !thread.ephemeral).length,
+    0,
+    "N parallel/sequential ephemeral tasks must add 0 persistent threads"
+  );
+});
+
+test("task --ephemeral rejects --resume-last", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--ephemeral", "--resume-last", "follow up"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /--ephemeral cannot be combined with --resume\/--resume-last/);
+});
+
+test("task --ephemeral rejects --resume", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--ephemeral", "--resume", "follow up"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /--ephemeral cannot be combined with --resume\/--resume-last/);
+});
+
+test("a completed ephemeral task cannot be picked up by a later --resume-last", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const firstRun = run("node", [SCRIPT, "task", "--ephemeral", "disposable check"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+
+  const resume = run("node", [SCRIPT, "task", "--resume-last", "follow up"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(resume.status, 1);
+  assert.match(resume.stderr, /No previous Codex task thread was found for this repository\./);
+});
+
 test("task-resume-candidate returns the latest rescue thread from the current session", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);

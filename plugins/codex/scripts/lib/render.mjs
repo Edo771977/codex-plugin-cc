@@ -100,7 +100,7 @@ function escapeMarkdownCell(value) {
 }
 
 function formatCodexResumeCommand(job) {
-  if (!job?.threadId) {
+  if (!job?.threadId || job.ephemeral) {
     return null;
   }
   return `codex resume ${job.threadId}`;
@@ -388,7 +388,8 @@ export function renderJobStatusReport(job) {
 }
 
 export function renderStoredJobResult(job, storedJob) {
-  const threadId = storedJob?.threadId ?? job.threadId ?? null;
+  const isEphemeral = Boolean(storedJob?.ephemeral ?? job.ephemeral);
+  const threadId = isEphemeral ? null : (storedJob?.threadId ?? job.threadId ?? null);
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;

@@ -79,7 +79,8 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--ephemeral] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "    --ephemeral: run without persisting the Codex thread. Ephemeral tasks cannot be resumed and do not appear in Codex Recent. Cannot be combined with --resume/--resume-last.",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -309,6 +310,7 @@ function findLatestResumableTaskJob(jobs) {
       (job) =>
         job.jobClass === "task" &&
         job.threadId &&
+        !job.ephemeral &&
         job.status !== "queued" &&
         job.status !== "running"
     ) ?? null
@@ -482,6 +484,7 @@ async function executeTaskRun(request) {
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
   }
 
+  const persistThread = resumeThreadId ? true : !request.ephemeral;
   const result = await runAppServerTurn(workspaceRoot, {
     resumeThreadId,
     prompt: request.prompt,
@@ -490,8 +493,8 @@ async function executeTaskRun(request) {
     effort: request.effort,
     sandbox: request.write ? "workspace-write" : "read-only",
     onProgress: request.onProgress,
-    persistThread: true,
-    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
+    persistThread,
+    threadName: persistThread ? buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT) : null
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
@@ -525,7 +528,8 @@ async function executeTaskRun(request) {
     summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
     jobTitle: taskMetadata.title,
     jobClass: "task",
-    write: Boolean(request.write)
+    write: Boolean(request.write),
+    ephemeral: !persistThread
   };
 }
 
@@ -601,7 +605,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId, ephemeral }) {
   return {
     cwd,
     model,
@@ -609,7 +613,8 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     prompt,
     write,
     resumeLast,
-    jobId
+    jobId,
+    ephemeral: Boolean(ephemeral)
   };
 }
 
@@ -762,7 +767,7 @@ async function handleReview(argv) {
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "ephemeral"],
     aliasMap: {
       m: "model"
     }
@@ -778,6 +783,10 @@ async function handleTask(argv) {
   const fresh = Boolean(options.fresh);
   if (resumeLast && fresh) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
+  }
+  const ephemeral = Boolean(options.ephemeral);
+  if (ephemeral && resumeLast) {
+    throw new Error("--ephemeral cannot be combined with --resume/--resume-last. Ephemeral tasks are not persisted and cannot be resumed.");
   }
   const write = Boolean(options.write);
   const taskMetadata = buildTaskRunMetadata({
@@ -797,7 +806,8 @@ async function handleTask(argv) {
       prompt,
       write,
       resumeLast,
-      jobId: job.id
+      jobId: job.id,
+      ephemeral
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
@@ -816,6 +826,7 @@ async function handleTask(argv) {
         write,
         resumeLast,
         jobId: job.id,
+        ephemeral,
         onProgress: progress
       }),
     { json: options.json }
