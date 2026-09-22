@@ -48,7 +48,11 @@ test("setup reports ready when fake codex is installed and authenticated", () =>
 test("setup is ready without npm when Codex is already installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
-  fs.symlinkSync(process.execPath, path.join(binDir, "node"));
+  if (process.platform === "win32") {
+    fs.writeFileSync(path.join(binDir, "node.cmd"), `@echo off\r\n"${process.execPath}" %*\r\n`, "utf8");
+  } else {
+    fs.symlinkSync(process.execPath, path.join(binDir, "node"));
+  }
 
   const result = run("node", [SCRIPT, "setup", "--json"], {
     cwd: ROOT,

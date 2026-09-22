@@ -198,8 +198,9 @@ test("terminateProcessTree uses taskkill on Windows", () => {
         error: null
       };
     },
-    killImpl() {
-      throw new Error("kill fallback should not run");
+    killImpl(pid, signal) {
+      assert.equal(pid, 1234);
+      assert.equal(signal, 0);
     }
   });
 
@@ -215,7 +216,8 @@ test("terminateProcessTree uses taskkill on Windows", () => {
   assert.equal(outcome.method, "taskkill");
 });
 
-test("terminateProcessTree treats missing Windows processes as already stopped", () => {
+test("terminateProcessTree uses liveness instead of localized taskkill output", () => {
+  let livenessChecks = 0;
   const outcome = terminateProcessTree(1234, {
     platform: "win32",
     runCommandImpl(command, args) {
@@ -224,17 +226,204 @@ test("terminateProcessTree treats missing Windows processes as already stopped",
         args,
         status: 128,
         signal: null,
-        stdout: "ERROR: The process \"1234\" not found.",
-        stderr: "",
+        stdout: "",
+        stderr: "Erreur : le processus \"1234\" est introuvable.",
         error: null
       };
+    },
+    killImpl(pid, signal) {
+      assert.equal(pid, 1234);
+      assert.equal(signal, 0);
+      livenessChecks += 1;
+      if (livenessChecks === 1) {
+        return;
+      }
+      const error = new Error("ESRCH");
+      error.code = "ESRCH";
+      throw error;
     }
   });
 
   assert.equal(outcome.attempted, true);
+  assert.equal(outcome.delivered, true);
   assert.equal(outcome.method, "taskkill");
   assert.equal(outcome.result.status, 128);
-  assert.match(outcome.result.stdout, /not found/i);
+  assert.equal(livenessChecks, 2);
+});
+
+test("terminateProcessTree reports delivery when taskkill only failed on already-exiting descendants", () => {
+  let livenessChecks = 0;
+  const outcome = terminateProcessTree(1234, {
+    platform: "win32",
+    runCommandImpl(command, args) {
+      return {
+        command,
+        args,
+        status: 128,
+        signal: null,
+        stdout: "SUCCESS: The process with PID 1234 has been terminated.",
+        stderr:
+          "ERROR: The process with PID 5678 (child process of PID 1234) could not be terminated.\n" +
+          "Reason: The operation attempted is not supported.",
+        error: null
+      };
+    },
+    killImpl(pid, signal) {
+      assert.equal(pid, 1234);
+      assert.equal(signal, 0);
+      livenessChecks += 1;
+      if (livenessChecks === 1) {
+        return;
+      }
+      const error = new Error("ESRCH");
+      error.code = "ESRCH";
+      throw error;
+    }
+  });
+
+  assert.equal(outcome.attempted, true);
+  assert.equal(outcome.delivered, true);
+  assert.equal(outcome.method, "taskkill");
+  assert.equal(outcome.result.status, 128);
+  assert.equal(livenessChecks, 2);
+});
+
+test("terminateProcessTree still throws when taskkill fails and the root process survives", () => {
+  assert.throws(
+    () =>
+      terminateProcessTree(1234, {
+        platform: "win32",
+        runCommandImpl(command, args) {
+          return {
+            command,
+            args,
+            status: 128,
+            signal: null,
+            stdout: "",
+            stderr: "ERROR: The process with PID 1234 could not be terminated.\nReason: Access is denied.",
+            error: null
+          };
+        },
+        killImpl(pid, signal) {
+          assert.equal(pid, 1234);
+          assert.equal(signal, 0);
+        }
+      }),
+    /could not be terminated/
+  );
+});
+
+test("terminateProcessTree skips taskkill when the Windows process is already absent", () => {
+  let taskkillCalled = false;
+  const outcome = terminateProcessTree(1234, {
+    platform: "win32",
+    runCommandImpl(command, args) {
+      taskkillCalled = true;
+      return {
+        command,
+        args,
+        status: 128,
+        signal: null,
+        stdout: "",
+        stderr: "Erreur : le processus \"1234\" est introuvable.",
+        error: null
+      };
+    },
+    killImpl(pid, signal) {
+      assert.equal(pid, 1234);
+      assert.equal(signal, 0);
+      const error = new Error("ESRCH");
+      error.code = "ESRCH";
+      throw error;
+    }
+  });
+
+  assert.equal(taskkillCalled, false);
+  assert.deepEqual(outcome, {
+    attempted: false,
+    delivered: false,
+    method: null
+  });
+});
+
+test("terminateProcessTree does not treat a Windows preflight permission error as missing", () => {
+  let taskkillCalled = false;
+  const outcome = terminateProcessTree(1234, {
+    platform: "win32",
+    runCommandImpl(command, args) {
+      taskkillCalled = true;
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: "",
+        stderr: "",
+        error: null
+      };
+    },
+    killImpl(pid, signal) {
+      assert.equal(pid, 1234);
+      assert.equal(signal, 0);
+      const error = new Error("EPERM");
+      error.code = "EPERM";
+      throw error;
+    }
+  });
+
+  assert.equal(taskkillCalled, true);
+  assert.equal(outcome.delivered, true);
+  assert.equal(outcome.method, "taskkill");
+});
+
+test("terminateProcessTree preserves the Windows ENOENT fallback", () => {
+  const killCalls = [];
+  const outcome = terminateProcessTree(1234, {
+    platform: "win32",
+    runCommandImpl(command, args) {
+      const error = new Error("ENOENT");
+      error.code = "ENOENT";
+      return {
+        command,
+        args,
+        status: 0,
+        signal: null,
+        stdout: "",
+        stderr: "",
+        error
+      };
+    },
+    killImpl(pid, signal) {
+      killCalls.push([pid, signal]);
+    }
+  });
+
+  assert.deepEqual(killCalls, [
+    [1234, 0],
+    [1234, undefined]
+  ]);
+  assert.deepEqual(outcome, {
+    attempted: true,
+    delivered: true,
+    method: "kill"
+  });
+});
+
+test("terminateProcessTree leaves the non-Windows process-group path unchanged", () => {
+  const killCalls = [];
+  const outcome = terminateProcessTree(1234, {
+    platform: "linux",
+    killImpl(pid, signal) {
+      killCalls.push([pid, signal]);
+    }
+  });
+
+  assert.deepEqual(killCalls, [[-1234, "SIGTERM"]]);
+  assert.deepEqual(outcome, {
+    attempted: true,
+    delivered: true,
+    method: "process-group"
+  });
 });
 
 test("a dead group leader with a surviving descendant still counts as a running tree", { skip: process.platform === "win32" }, async () => {
@@ -369,6 +558,10 @@ test("forceKillProcessTree reaches descendants on Windows instead of signalling 
 test("forceKillProcessTree never throws when the Windows tree cannot be reached", () => {
   const outcome = forceKillProcessTree(1234, {
     platform: "win32",
+    // A root that reads as live, so the pre-kill probe does not short-circuit the taskkill this
+    // test is about. Injected rather than real: otherwise the outcome would depend on whether
+    // pid 1234 happens to exist on the machine running the suite.
+    killImpl() {},
     runCommandImpl(command, args) {
       return {
         command,

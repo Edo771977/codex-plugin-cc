@@ -427,6 +427,7 @@ Broker and background-job lifecycle:
 | [#772](https://github.com/openai/codex-plugin-cc/pull/772) | the stop-review gate keeps a minute of headroom under the Stop hook's budget, so a timed-out review can still say so instead of ending the turn silently |
 | [#774](https://github.com/openai/codex-plugin-cc/pull/774) | `status --wait` prints its timeout and exits non-zero, instead of looking like a finished status check |
 | [#773](https://github.com/openai/codex-plugin-cc/pull/773) | a broker connect that never completes is given up on after 2s and falls back to a direct app-server (the probe half of that PR is not taken: ours already bounds each attempt *and* reports why it failed) |
+| [#776](https://github.com/openai/codex-plugin-cc/pull/776) | Windows teardown decides on the root's liveness instead of taskkill's message: a process already gone costs no `taskkill` at all, and a `taskkill` that reports failure only because a short-lived descendant exited mid-walk no longer throws at the caller (its broker-endpoint and shutdown-timeout changes are not taken — one is a no-op here, the other is behind what this fork already does) |
 
 Commands and flags:
 
