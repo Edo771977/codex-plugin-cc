@@ -160,12 +160,12 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /Never add a `--sandbox` on your own/i);
   assert.match(agent, /Return the stdout of the `codex-companion` command exactly as-is/i);
   assert.match(agent, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
-  assert.match(agent, /gpt-5-4-prompting/);
+  assert.match(agent, /gpt-6-prompting/);
   assert.match(agent, /only to tighten the user's request into a better Codex prompt/i);
   assert.match(agent, /Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work/i);
   assert.match(runtimeSkill, /only job is to invoke `task` once and return that stdout unchanged/i);
   assert.match(runtimeSkill, /Do not call `setup`, `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
-  assert.match(runtimeSkill, /use the `gpt-5-4-prompting` skill to rewrite the user's request into a tighter Codex prompt/i);
+  assert.match(runtimeSkill, /use the `gpt-6-prompting` skill to rewrite the user's request into a tighter Codex prompt/i);
   assert.match(runtimeSkill, /That prompt drafting is the only Claude-side work allowed/i);
   assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
   assert.match(runtimeSkill, /Leave model unset by default/i);
@@ -227,18 +227,51 @@ test("transfer, result, and cancel commands are exposed as deterministic runtime
 
 test("internal docs use task terminology for rescue runs", () => {
   const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
-  const promptingSkill = read("skills/gpt-5-4-prompting/SKILL.md");
-  const promptRecipes = read("skills/gpt-5-4-prompting/references/codex-prompt-recipes.md");
+  const promptingSkill = read("skills/gpt-6-prompting/SKILL.md");
+  const promptRecipes = read("skills/gpt-6-prompting/references/recipes.md");
+  const promptBlocks = read("skills/gpt-6-prompting/references/blocks.md");
 
   assert.match(runtimeSkill, /codex-companion\.mjs" task "<raw arguments>"/);
   assert.match(runtimeSkill, /Use `task` for every rescue request/i);
   assert.match(runtimeSkill, /task --resume-last/i);
   assert.match(runtimeSkill, /--resume-thread <id>/i);
   assert.match(promptingSkill, /Use `task` when the task is diagnosis/i);
-  assert.match(promptRecipes, /Codex task prompts/i);
-  assert.match(promptRecipes, /Use these as starting templates for Codex task prompts/i);
-  assert.match(promptRecipes, /## Diagnosis/);
-  assert.match(promptRecipes, /## Narrow Fix/);
+  assert.match(promptingSkill, /task --resume-last/);
+  assert.match(promptRecipes, /## Sol: implementation/);
+  assert.match(promptRecipes, /## Luna: strictly specified coding/);
+  assert.match(promptBlocks, /<autonomy>/);
+  assert.match(promptBlocks, /<repo_policy>/);
+  assert.match(promptBlocks, /<progress_updates>/);
+});
+
+test("the prompting skill's launch lines use models and efforts this fork accepts", () => {
+  // The skill is instructions the rescue subagent follows literally, so a model or effort it
+  // names has to be one this plugin forwards. Upstream's copy launches with bare aliases
+  // (`--model luna`), and this fork's only alias is `spark`: a bare alias would reach Codex
+  // verbatim and fail. Read from the plugin's own validators rather than from prose.
+  const companion = fs.readFileSync(path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs"), "utf8");
+  const aliases = new Set(
+    [...companion.matchAll(/MODEL_ALIASES = new Map\(\[([\s\S]*?)\]\);/g)]
+      .flatMap((match) => [...match[1].matchAll(/\["([^"]+)",\s*"[^"]+"\]/g)].map((pair) => pair[1]))
+  );
+  const efforts = new Set(
+    [...companion.matchAll(/VALID_REASONING_EFFORTS = new Set\(\[([^\]]*)\]\)/g)]
+      .flatMap((match) => [...match[1].matchAll(/"([^"]+)"/g)].map((value) => value[1]))
+  );
+  assert.ok(aliases.size > 0 && efforts.size > 0, "could not read the plugin's own validators");
+
+  for (const relative of ["skills/gpt-6-prompting/SKILL.md", "skills/gpt-6-prompting/references/recipes.md"]) {
+    const source = read(relative);
+    for (const [, model] of source.matchAll(/--model\s+([A-Za-z0-9.\-]+)/g)) {
+      assert.ok(
+        aliases.has(model) || model.includes("-"),
+        `${relative} launches with \`--model ${model}\`, which is neither an alias of this fork nor a full slug`
+      );
+    }
+    for (const [, effort] of source.matchAll(/--effort\s+([a-z]+)/g)) {
+      assert.ok(efforts.has(effort), `${relative} names an effort this fork rejects: ${effort}`);
+    }
+  }
 });
 
 test("hooks and deterministic commands use the portable Node launcher", () => {
