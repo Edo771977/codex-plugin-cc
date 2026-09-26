@@ -16,6 +16,7 @@
 - Release the broker's app-server thread subscriptions when a client disconnects, so a departed client no longer leaks them for the broker's lifetime (openai/codex-plugin-cc#707).
 - Read state from every candidate `CLAUDE_PLUGIN_DATA` root, so jobs and broker records written by one invocation are not invisible to another (openai/codex-plugin-cc#659).
 - Reconcile a job against its worker process, so a job whose worker died stops reading as running (openai/codex-plugin-cc#728).
+- Replace the internal `gpt-5-4-prompting` skill with `gpt-6-prompting`: GPT-6 brief blocks (autonomy, repo policy, verification states, progress updates, output contracts) and per-model recipes for Luna, Sol and Astra (openai/codex-plugin-cc#784, skill commit only). Its launch lines use full model slugs and its effort note matches this fork's validators.
 
 ## 1.0.0
 

@@ -31,12 +31,12 @@ Effort:
 - Luna: `none` or `low` for lookups, extraction, and bulk vision; `medium` for
   research and coding; `high` only when a medium run demonstrably fell short.
 - Sol: `medium` by default; `high` for large multi-part jobs; `low` for small edits.
-- Astra: `low` or `medium` only. Never above `medium`, since it burns tokens
-  and the plugin rejects it. It has no `none`; use `low`.
+- Astra: `low` or `medium` only. Never above `medium`: it burns tokens for no
+  gain. It has no `none`; use `low`.
 - Tighten the brief before raising effort. A sharper contract beats more reasoning.
-- The Codex plugin caps every model at `high` by policy (a cost choice, not a
-  model limit; the models accept up to `max`). Do not pass `xhigh`, `max`, or
-  `ultra`.
+- Keep effort at `high` or below. This fork accepts `xhigh` as well, so nothing
+  stops you from passing it: treat that as a cost decision to make deliberately,
+  not a default. `max` and `ultra` are not accepted at all.
 
 Escalate without asking when output misses the bar: Luna → Sol → Astra (or a
 Claude reviewer). Judge the output, not the price.

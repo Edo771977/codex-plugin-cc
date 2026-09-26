@@ -5,7 +5,7 @@ lines that do not apply. Blocks are defined in `blocks.md`.
 
 ## Luna: research or lookup
 
-Launch: `--model luna --effort medium --sandbox read-only` (`low` for a single
+Launch: `--model gpt-6-luna --effort medium --sandbox read-only` (`low` for a single
 fact).
 
 ```xml
@@ -38,7 +38,7 @@ Spot-check a sample yourself before trusting the batch.
 
 ## Luna: strictly specified coding
 
-Use only when you can write the spec. Launch with `--model luna --effort medium`.
+Use only when you can write the spec. Launch with `--model gpt-6-luna --effort medium`.
 
 ```xml
 <task>In <absolute repo path>, implement <function/feature>.
@@ -61,7 +61,7 @@ Hand the job to Sol.
 
 ## Sol: implementation
 
-Launch: `--model sol --effort medium` (`high` for large multi-part work), with
+Launch: `--model gpt-6-sol --effort medium` (`high` for large multi-part work), with
 `--worktree-name <name>` when the main checkout must stay clean.
 
 ```xml
@@ -95,7 +95,7 @@ No praise, no summary of the change.</output_contract>
 
 ## Astra: architecture review or second opinion
 
-Launch: `--model astra --effort medium --sandbox read-only`. Use sparingly.
+Launch: `--model gpt-6-astra --effort medium --sandbox read-only`. Use sparingly.
 
 ```xml
 <task>Architecture review of <system/plan at paths>. Decision under review:
@@ -108,7 +108,7 @@ alternative; what you would not change.</output_contract>
 
 ## Astra: prompt author
 
-Launch: `--model astra --effort medium --sandbox read-only`.
+Launch: `--model gpt-6-astra --effort medium --sandbox read-only`.
 
 ```xml
 <task>Write a production prompt for <target model and effort, e.g. gpt-6-luna
@@ -134,7 +134,7 @@ Then validate independently; do not trust Astra's own labels:
 ## Astra: complex computer use
 
 For hard visual reconstruction, such as redrawing a sketch or screenshot as a
-Figma design, or other precise multi-step GUI work. Launch with `--model astra
+Figma design, or other precise multi-step GUI work. Launch with `--model gpt-6-astra
 --effort medium --full`. Include the target file or URL, the reference image
 paths, a definition of done ("every element in the reference exists with
 matching position ±8px and matching text"), `<stop_rules>`, and evidence rules
