@@ -399,6 +399,29 @@ These are advanced knobs for tuning resource usage in long-running or resource-c
 
 One broker serves every session in a workspace. It is shut down by the last session out, never by a session that still has another's work in flight, and it releases its Codex thread subscriptions as clients disconnect, so a departed session's notifications never reach the next one.
 
+### Skills The Plugin Carries
+
+Three internal skills ship with the plugin. None is user-invocable: they are contracts the rescue
+subagent and the result presentation follow, and they are listed here because they decide how your
+request reaches Codex.
+
+| Skill | What it governs |
+| --- | --- |
+| `codex-cli-runtime` | The forwarding contract: the subagent's only job is to call `task` once and return its stdout unchanged. It also fixes what the subagent may *not* do — no `setup`, `review`, `status`, `result` or `cancel`, no reasoning through the problem itself. |
+| `gpt-6-prompting` | How a request is turned into a Codex brief: which model to pick (Luna for bulk and well-specified work, Sol for multi-file implementation and review, Astra for architecture or a second opinion), which reasoning effort, and per-model recipes for diagnosis, implementation, review, research and vision. |
+| `codex-result-handling` | How Codex's output comes back to you: its verdict, findings and file paths preserved as reported, findings ordered by severity, and the distinction between fact, inference and open question kept. It also forbids acting on a review by itself — after presenting findings Claude stops and asks which ones to fix, and a failed Codex run is reported rather than replaced by a Claude-side attempt. |
+
+Two notes on the prompting skill, since it is the one that changes what you get:
+
+- its launch lines use full model slugs (`gpt-6-luna`, `gpt-6-sol`, `gpt-6-astra`). This fork maps
+  only one short alias, `spark` → `gpt-5.3-codex-spark`; every other `--model` value is forwarded to
+  Codex verbatim, so the slug is what works
+- it advises staying at `high` effort or below. That is advice about cost, not a limit: `--effort
+  xhigh` is accepted. `max` and `ultra` are not
+- a test reads this fork's own model and effort validators and checks every `--model`/`--effort` the
+  skill names against them, so the guidance cannot drift into naming something the plugin would
+  reject or pass through as a literal word
+
 ### Moving The Work Over To Codex
 
 Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
