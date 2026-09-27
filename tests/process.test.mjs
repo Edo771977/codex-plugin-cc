@@ -53,3 +53,35 @@ test("terminateProcessTree treats missing Windows processes as already stopped",
   assert.equal(outcome.result.status, 128);
   assert.match(outcome.result.stdout, /not found/i);
 });
+
+test("terminateProcessTree signals the process when it does not lead a process group", () => {
+  const calls = [];
+  const outcome = terminateProcessTree(1234, {
+    platform: "linux",
+    killImpl(pid, signal) {
+      calls.push([pid, signal]);
+      if (pid < 0) {
+        throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+      }
+    }
+  });
+
+  assert.deepEqual(calls, [
+    [-1234, "SIGTERM"],
+    [1234, "SIGTERM"]
+  ]);
+  assert.equal(outcome.delivered, true);
+  assert.equal(outcome.method, "process");
+});
+
+test("terminateProcessTree treats missing POSIX processes as already stopped", () => {
+  const outcome = terminateProcessTree(1234, {
+    platform: "linux",
+    killImpl() {
+      throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+    }
+  });
+
+  assert.equal(outcome.attempted, true);
+  assert.equal(outcome.delivered, false);
+});
