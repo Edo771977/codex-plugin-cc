@@ -26,7 +26,7 @@ they already have.
 | --- | --- | --- |
 | [`/codex:review`](#codexreview) | read-only Codex review of your current work | `--wait`, `--background`, `--base <ref>`, `--scope <auto\|working-tree\|branch>`, `--model <model\|spark\|sol\|luna\|astra>`, `--effort <level>` |
 | [`/codex:adversarial-review`](#codexadversarial-review) | steerable review that challenges the approach | same as `/codex:review`, plus free-form focus text |
-| [`/codex:rescue`](#codexrescue) | delegate investigation or a fix to Codex | `--background`, `--wait`, `--resume`, `--resume-thread <id>`, `--fresh`, `--ephemeral`, `--model`, `--effort`, `--write`, `--sandbox <mode>`, `--read-root <dir>` |
+| [`/codex:rescue`](#codexrescue) | delegate investigation or a fix to Codex | `--background`, `--wait`, `--resume`, `--resume-thread <id>`, `--fresh`, `--ephemeral`, `--model <model\|spark\|sol\|luna\|astra>`, `--effort`, `--write`, `--sandbox <mode>`, `--read-root <dir>` |
 | [`/codex:transfer`](#codextransfer) | turn this Claude session into a resumable Codex thread | `--source <claude-jsonl>` |
 | [`/codex:status`](#codexstatus) | show active and recent Codex jobs | `[job-id]`, `--wait`, `--timeout-ms <ms>`, `--all` |
 | [`/codex:result`](#codexresult) | show the stored output of a finished job | `[job-id]` |
@@ -140,7 +140,7 @@ Use it when you want:
 - a review of your current uncommitted changes
 - a review of your branch compared to a base branch like `main`
 
-Use `--base <ref>` for branch review. It also supports `--wait`, `--background`, `--scope <auto|working-tree|branch>`, and — like `/codex:rescue` — `--model <model|spark|sol|luna|astra>` and `--effort <level>` to pick the reviewing model and how hard it thinks. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
+Use `--base <ref>` for branch review. It also supports `--wait`, `--background`, `--scope <auto|working-tree|branch>`, and — like `/codex:rescue` — `--model <model|spark|sol|luna|astra>` to pick the reviewing model. `--effort <level>` is accepted and validated here, but the plugin does not pass it to a native review: Codex runs that review at its own reasoning effort. This review is also not steerable and takes no custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area, or when the reasoning effort has to be yours to choose.
 
 Examples:
 
@@ -219,7 +219,7 @@ Ask Codex to redesign the database connection to be more resilient.
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
-- the GPT-6 models have short aliases too: `sol`, `luna` and `astra` map to `gpt-6-sol`, `gpt-6-luna` and `gpt-6-astra`. Aliases are case-insensitive and are expanded by the plugin on every command that takes `--model`, so a full slug and its alias behave identically. Any other value is forwarded to Codex verbatim
+- the GPT-6 models have short aliases too: `sol`, `luna` and `astra` map to `gpt-6-sol`, `gpt-6-luna` and `gpt-6-astra`. Aliases are case-insensitive and are expanded by the plugin on every command that takes `--model`, so a full slug and its alias behave identically. Any other value reaches Codex as you typed it, minus surrounding whitespace — which also means these four words are reserved: a model genuinely named `sol` on a custom provider cannot be selected by that name
 - follow-up rescue requests can continue the latest Codex task in the repo
 - `--resume`/`--resume-last` continues the newest thread for this repository; `--resume-thread <id>` continues one specific thread (the id is printed by `/codex:status` and `/codex:result`). `--resume`, `--resume-thread`, and `--fresh` are mutually exclusive.
 - `--ephemeral` runs without persisting the Codex thread: nothing is added to Codex's Recent list, and there is no thread to come back to. Useful for disposable, fire-and-forget work — many parallel subtasks from an orchestrating agent, say — where the persistent threads are only noise. It is refused together with `--resume`, `--resume-last` and `--resume-thread`, an ephemeral run is never offered as a `--resume-last` candidate, and `/codex:status` and `/codex:result` stop printing a `codex resume` line for it. Without the flag nothing changes: threads persist exactly as before.
@@ -415,13 +415,14 @@ request reaches Codex.
 Two notes on the prompting skill, since it is the one that changes what you get:
 
 - its launch lines use full model slugs (`gpt-6-luna`, `gpt-6-sol`, `gpt-6-astra`). Those slugs also
-  have short aliases here (`luna`, `sol`, `astra`, plus `spark` → `gpt-5.3-codex-spark`), so either
+  have short aliases here (`sol`, `luna`, `astra`, plus `spark` → `gpt-5.3-codex-spark`), so either
   form works; every other `--model` value is forwarded to Codex verbatim
 - it advises staying at `high` effort or below. That is advice about cost, not a limit: `--effort
   xhigh` is accepted. `max` and `ultra` are not
-- a test reads this fork's own model and effort validators and checks every `--model`/`--effort` the
-  skill names against them, so the guidance cannot drift into naming something the plugin would
-  reject or pass through as a literal word
+- a test reads this fork's own alias map and effort validator and checks every `--model`/`--effort`
+  the skill names against them. The effort half is exact; the model half only catches a bare word
+  that is not an alias, because the plugin keeps no list of valid models — a slug it does not know is
+  forwarded and rejected by Codex, not by the plugin
 
 ### Moving The Work Over To Codex
 

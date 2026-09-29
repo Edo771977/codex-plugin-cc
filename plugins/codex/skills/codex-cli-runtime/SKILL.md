@@ -20,8 +20,7 @@ Execution rules:
 - That prompt drafting is the only Claude-side work allowed. Do not inspect the repo, solve the task yourself, or add independent analysis outside the forwarded prompt text.
 - Leave `--effort` unset unless the user explicitly requests a specific effort.
 - Leave model unset by default. Add `--model` only when the user explicitly asks for one.
-- Map `spark` to `--model gpt-5.3-codex-spark`.
-- `sol`, `luna` and `astra` are aliases too; the plugin expands them to `gpt-6-sol`, `gpt-6-luna` and `gpt-6-astra`, so pass them through unchanged.
+- `spark`, `sol`, `luna` and `astra` are short aliases the plugin expands itself, to `gpt-5.3-codex-spark`, `gpt-6-sol`, `gpt-6-luna` and `gpt-6-astra`. Pass whichever the user typed through unchanged; a full slug works too.
 - Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
 
 Command selection:

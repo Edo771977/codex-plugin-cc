@@ -4,6 +4,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
+import { MODEL_ALIASES } from "../plugins/codex/scripts/lib/models.mjs";
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 
@@ -122,7 +124,8 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /never add a `--sandbox` yourself/i);
   assert.match(rescue, /a `--sandbox` inside the task text is part of the prompt and stays there/i);
   assert.match(rescue, /Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort/i);
-  assert.match(rescue, /If they ask for `spark`, map it to `gpt-5\.3-codex-spark`/i);
+  assert.match(rescue, /`spark`, `sol`, `luna` and `astra` are short aliases the plugin expands itself/i);
+  assert.match(rescue, /Pass the alias through unchanged/i);
   assert.match(rescue, /If the request includes `--resume`, do not ask whether to continue/i);
   assert.match(rescue, /If the request includes `--fresh`, do not ask whether to continue/i);
   assert.match(rescue, /If the request includes `--resume-thread <id>`, do not ask whether to continue/i);
@@ -153,7 +156,8 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
   assert.match(agent, /Leave `--effort` unset unless the user explicitly requests a specific reasoning effort/i);
   assert.match(agent, /Leave model unset by default/i);
-  assert.match(agent, /If the user asks for `spark`, map that to `--model gpt-5\.3-codex-spark`/i);
+  assert.match(agent, /`spark`, `sol`, `luna` and `astra` are short aliases the plugin expands itself/i);
+  assert.match(agent, /Pass whichever the user typed through with `--model`, unchanged/i);
   assert.match(agent, /If the user asks for a concrete model name such as `gpt-5\.4-mini`, pass it through with `--model`/i);
   assert.match(agent, /If the user passes `--sandbox <read-only\|workspace-write\|danger-full-access>` before the task text, forward it in that position and do not add `--write`/i);
   assert.match(agent, /A `--sandbox` inside the task text is part of the prompt: leave it there/i);
@@ -169,7 +173,8 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /That prompt drafting is the only Claude-side work allowed/i);
   assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
   assert.match(runtimeSkill, /Leave model unset by default/i);
-  assert.match(runtimeSkill, /Map `spark` to `--model gpt-5\.3-codex-spark`/i);
+  assert.match(runtimeSkill, /`spark`, `sol`, `luna` and `astra` are short aliases the plugin expands itself/i);
+  assert.match(runtimeSkill, /Pass whichever the user typed through unchanged/i);
   assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
   assert.match(runtimeSkill, /Strip it before calling `task`/i);
   assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);
@@ -244,16 +249,36 @@ test("internal docs use task terminology for rescue runs", () => {
   assert.match(promptBlocks, /<progress_updates>/);
 });
 
+test("the prompting skill only names flags this plugin actually parses", () => {
+  // The skill's launch lines are copied into a `task` command by the rescue subagent. An
+  // unknown flag is not rejected: `parseArgs` pushes it into the positionals, so it lands
+  // inside the Codex prompt as literal text. Upstream's copy named `--full` and
+  // `--worktree-name`, neither of which exists here.
+  const companion = fs.readFileSync(path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs"), "utf8");
+  const parsed = new Set(
+    [...companion.matchAll(/(?:value|boolean|multiValue)Options:\s*\[([^\]]*)\]/g)]
+      .flatMap((match) => [...match[1].matchAll(/"([^"]+)"/g)].map((option) => option[1]))
+  );
+  assert.ok(parsed.has("model") && parsed.has("read-root"), "could not read the parsed option names");
+
+  for (const relative of [
+    "skills/gpt-6-prompting/SKILL.md",
+    "skills/gpt-6-prompting/references/recipes.md",
+    "skills/gpt-6-prompting/references/blocks.md"
+  ]) {
+    for (const [, flag] of read(relative).matchAll(/--([a-z][a-z-]*)/g)) {
+      assert.ok(parsed.has(flag), `${relative} names \`--${flag}\`, which no command parses`);
+    }
+  }
+});
+
 test("the prompting skill's launch lines use models and efforts this fork accepts", () => {
   // The skill is instructions the rescue subagent follows literally, so a model or effort it
   // names has to be one this plugin forwards: either an alias it expands or a full slug it
   // passes through. Anything else reaches Codex verbatim and fails there. Read from the
   // plugin's own validators rather than from prose.
   const companion = fs.readFileSync(path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs"), "utf8");
-  const aliases = new Set(
-    [...companion.matchAll(/MODEL_ALIASES = new Map\(\[([\s\S]*?)\]\);/g)]
-      .flatMap((match) => [...match[1].matchAll(/\["([^"]+)",\s*"[^"]+"\]/g)].map((pair) => pair[1]))
-  );
+  const aliases = new Set(MODEL_ALIASES.keys());
   const efforts = new Set(
     [...companion.matchAll(/VALID_REASONING_EFFORTS = new Set\(\[([^\]]*)\]\)/g)]
       .flatMap((match) => [...match[1].matchAll(/"([^"]+)"/g)].map((value) => value[1]))
@@ -274,27 +299,47 @@ test("the prompting skill's launch lines use models and efforts this fork accept
   }
 });
 
-test("the commands advertise exactly the model aliases the plugin expands", () => {
-  // The alias list in an argument-hint is the only place a user sees which short names work.
-  // A new alias in the map with no hint is invisible; a hint naming one the map lacks sends a
-  // bare word to Codex, which rejects it. Pin both directions to the map itself.
-  const companion = fs.readFileSync(path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs"), "utf8");
-  const aliases = new Set(
-    [...companion.matchAll(/MODEL_ALIASES = new Map\(\[([\s\S]*?)\]\);/g)]
-      .flatMap((match) => [...match[1].matchAll(/\["([^"]+)",\s*"[^"]+"\]/g)].map((pair) => pair[1]))
-  );
-  assert.ok(aliases.size > 0, "could not read the plugin's alias map");
+test("every command that takes --model advertises exactly the aliases the plugin expands", () => {
+  // The alias list in an argument-hint, and in the script's own usage text, is where a user
+  // sees which short names work. An alias in the map with no hint is invisible; a hint naming
+  // one the map lacks sends a bare word to Codex, which rejects it. Build the expected token
+  // from the map itself, so order and membership cannot drift apart.
+  const expected = `--model <model|${[...MODEL_ALIASES.keys()].join("|")}>`;
+  assert.ok(MODEL_ALIASES.size > 1, "the alias map looks empty");
 
   for (const relative of ["commands/rescue.md", "commands/review.md", "commands/adversarial-review.md"]) {
-    const source = read(relative);
-    const hint = source.match(/--model <([^>]+)>/);
-    assert.ok(hint, `${relative} does not advertise --model at all`);
-    const advertised = hint[1].split("|").filter((value) => value !== "model");
-    assert.deepEqual(
-      [...advertised].sort(),
-      [...aliases].sort(),
-      `${relative} advertises model aliases that do not match MODEL_ALIASES`
+    // Anchored to the front-matter line: a `--model` mentioned in the body is not the hint.
+    const hint = read(relative).match(/^argument-hint:\s*(.+)$/m);
+    assert.ok(hint, `${relative} has no argument-hint`);
+    assert.ok(
+      hint[1].includes(expected),
+      `${relative} argument-hint should advertise \`${expected}\`, got: ${hint[1]}`
     );
+  }
+
+  // `review`, `adversarial-review` and `task` are the subcommands that parse --model.
+  const companion = fs.readFileSync(path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs"), "utf8");
+  const usage = new Map(
+    [...companion.matchAll(/"\s+node scripts\/codex-companion\.mjs ([a-z-]+)([^"]*)"/g)].map((match) => [
+      match[1],
+      match[2]
+    ])
+  );
+  for (const subcommand of ["review", "adversarial-review", "task"]) {
+    const line = usage.get(subcommand);
+    assert.ok(line !== undefined, `printUsage has no line for ${subcommand}`);
+    assert.ok(
+      line.includes(expected),
+      `the ${subcommand} usage line should advertise \`${expected}\`, got: ${line}`
+    );
+  }
+  for (const [subcommand, line] of usage) {
+    if (line.includes("--model")) {
+      assert.ok(
+        line.includes(expected),
+        `the ${subcommand} usage line advertises --model with a stale alias list: ${line}`
+      );
+    }
   }
 });
 
