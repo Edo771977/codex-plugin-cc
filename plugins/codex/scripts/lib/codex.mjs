@@ -104,8 +104,16 @@ function looksLikeVerificationCommand(command) {
   );
 }
 
+// Prompts shaped by the gpt-5-4-prompting skill carry the job in a `<task>` block,
+// often after other instructions, so name the thread after that block when present.
+function taskThreadNameSource(prompt) {
+  const text = String(prompt ?? "");
+  const taskBlock = /<task>([\s\S]*?)(?:<\/task>|$)/.exec(text)?.[1];
+  return taskBlock?.trim() ? taskBlock : text;
+}
+
 function buildTaskThreadName(prompt) {
-  const excerpt = shorten(prompt, 56);
+  const excerpt = shorten(taskThreadNameSource(prompt), 56);
   return excerpt ? `${TASK_THREAD_PREFIX}: ${excerpt}` : TASK_THREAD_PREFIX;
 }
 

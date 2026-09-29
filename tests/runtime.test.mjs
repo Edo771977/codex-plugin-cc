@@ -175,6 +175,54 @@ test("task runs when the active provider does not require OpenAI login", () => {
   assert.match(result.stdout, /Handled the requested task/);
 });
 
+test("task names the thread after the <task> block of a structured prompt", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const promptPath = path.join(repo, "prompt.txt");
+  fs.writeFileSync(
+    promptPath,
+    [
+      "Stay read-only.",
+      "<task>",
+      "Fix the flaky login test",
+      "</task>",
+      "<structured_output_contract>",
+      "Return a numbered list.",
+      "</structured_output_contract>"
+    ].join("\n"),
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "task", "--prompt-file", promptPath], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.threads[0].name, "Codex Companion Task: Fix the flaky login test");
+});
+
+test("task names the thread after the prompt when it has no <task> block", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const promptPath = path.join(repo, "prompt.txt");
+  fs.writeFileSync(promptPath, "check Map<string> typing in the auth module", "utf8");
+
+  const result = run("node", [SCRIPT, "task", "--prompt-file", promptPath], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.threads[0].name, "Codex Companion Task: check Map<string> typing in the auth module");
+});
+
 test("task runs without auth preflight so Codex can refresh an expired session", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
