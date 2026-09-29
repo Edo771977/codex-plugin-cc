@@ -71,6 +71,7 @@ import {
   renderStatusReport,
   renderTaskResult
 } from "./lib/render.mjs";
+import { normalizeRequestedModel } from "./lib/models.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
@@ -80,7 +81,6 @@ const CANCEL_TURN_INTERRUPT_TIMEOUT_MS = 5000;
 const CANCEL_TURN_IDENTITY_WAIT_MS = 3000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const VALID_SANDBOX_MODES = new Set(["read-only", "workspace-write", "danger-full-access"]);
-const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function printUsage() {
@@ -88,9 +88,9 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--ephemeral] [--sandbox <read-only|workspace-write|danger-full-access>] [--read-root <directory> ...] [--resume-last|--resume|--resume-thread <id>|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|astra>]",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|astra>] [--effort <none|minimal|low|medium|high|xhigh>] [focus text]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--ephemeral] [--sandbox <read-only|workspace-write|danger-full-access>] [--read-root <directory> ...] [--resume-last|--resume|--resume-thread <id>|--fresh] [--model <model|spark|sol|luna|astra>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "    --ephemeral: run without persisting the Codex thread. Ephemeral tasks cannot be resumed and do not appear in Codex Recent. Cannot be combined with --resume/--resume-last/--resume-thread.",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
@@ -110,17 +110,6 @@ function outputResult(value, asJson) {
 
 function outputCommandResult(payload, rendered, asJson) {
   outputResult(asJson ? payload : rendered, asJson);
-}
-
-function normalizeRequestedModel(model) {
-  if (model == null) {
-    return null;
-  }
-  const normalized = String(model).trim();
-  if (!normalized) {
-    return null;
-  }
-  return MODEL_ALIASES.get(normalized.toLowerCase()) ?? normalized;
 }
 
 function normalizeReasoningEffort(effort) {
@@ -851,6 +840,7 @@ async function handleReviewCommand(argv, config) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
+  const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
   const focusText = positionals.join(" ").trim();
   const target = resolveReviewTarget(cwd, {
@@ -875,7 +865,7 @@ async function handleReviewCommand(argv, config) {
         cwd,
         base: options.base,
         scope: options.scope,
-        model: options.model,
+        model,
         effort,
         focusText,
         reviewName: config.reviewName,

@@ -1115,6 +1115,63 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   assert.equal(fakeState.lastTurnStart.effort, "low");
 });
 
+test("task expands the short model aliases to the slugs Codex accepts", () => {
+  // A bare alias reaches Codex verbatim and fails there, so the expansion is the whole
+  // point of the alias: assert the slug that leaves the plugin, not the flag that went in.
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  for (const [alias, slug] of [
+    ["sol", "gpt-6-sol"],
+    ["luna", "gpt-6-luna"],
+    ["Astra", "gpt-6-astra"]
+  ]) {
+    const result = run("node", [SCRIPT, "task", "--model", alias, "diagnose the failing test"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(fakeState.lastTurnStart.model, slug, `--model ${alias} should reach Codex as ${slug}`);
+  }
+});
+
+test("the review commands expand model aliases the same way task does", () => {
+  // `--model <model|spark|sol|luna|astra>` is documented on review and adversarial-review too,
+  // and those paths used to forward the raw flag value straight to Codex.
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0];\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0].id;\n");
+
+  const review = run("node", [SCRIPT, "review", "--model", "luna"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(review.status, 0, review.stderr);
+  // The native review runs inside the thread it starts, so the model is chosen at thread/start.
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).lastThreadStart.model, "gpt-6-luna");
+
+  const adversarial = run("node", [SCRIPT, "adversarial-review", "--model", "spark"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(adversarial.status, 0, adversarial.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart.model, "gpt-5.3-codex-spark");
+});
+
 test("task defaults to a read-only sandbox and --write selects workspace-write", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
