@@ -105,7 +105,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.doesNotMatch(rescue, /^context:\s*fork\b/m);
   assert.match(rescue, /--background\|--wait/);
   assert.match(rescue, /--resume\|--resume-thread <id>\|--fresh/);
-  assert.match(rescue, /--model <model\|spark>/);
+  assert.match(rescue, /--model <model\|spark\|sol\|luna\|astra>/);
   assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh>/);
   assert.match(rescue, /--sandbox <read-only\|workspace-write\|danger-full-access>/);
   assert.match(rescue, /--read-root <directory>/);
@@ -246,9 +246,9 @@ test("internal docs use task terminology for rescue runs", () => {
 
 test("the prompting skill's launch lines use models and efforts this fork accepts", () => {
   // The skill is instructions the rescue subagent follows literally, so a model or effort it
-  // names has to be one this plugin forwards. Upstream's copy launches with bare aliases
-  // (`--model luna`), and this fork's only alias is `spark`: a bare alias would reach Codex
-  // verbatim and fail. Read from the plugin's own validators rather than from prose.
+  // names has to be one this plugin forwards: either an alias it expands or a full slug it
+  // passes through. Anything else reaches Codex verbatim and fails there. Read from the
+  // plugin's own validators rather than from prose.
   const companion = fs.readFileSync(path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs"), "utf8");
   const aliases = new Set(
     [...companion.matchAll(/MODEL_ALIASES = new Map\(\[([\s\S]*?)\]\);/g)]
@@ -271,6 +271,30 @@ test("the prompting skill's launch lines use models and efforts this fork accept
     for (const [, effort] of source.matchAll(/--effort\s+([a-z]+)/g)) {
       assert.ok(efforts.has(effort), `${relative} names an effort this fork rejects: ${effort}`);
     }
+  }
+});
+
+test("the commands advertise exactly the model aliases the plugin expands", () => {
+  // The alias list in an argument-hint is the only place a user sees which short names work.
+  // A new alias in the map with no hint is invisible; a hint naming one the map lacks sends a
+  // bare word to Codex, which rejects it. Pin both directions to the map itself.
+  const companion = fs.readFileSync(path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs"), "utf8");
+  const aliases = new Set(
+    [...companion.matchAll(/MODEL_ALIASES = new Map\(\[([\s\S]*?)\]\);/g)]
+      .flatMap((match) => [...match[1].matchAll(/\["([^"]+)",\s*"[^"]+"\]/g)].map((pair) => pair[1]))
+  );
+  assert.ok(aliases.size > 0, "could not read the plugin's alias map");
+
+  for (const relative of ["commands/rescue.md", "commands/review.md", "commands/adversarial-review.md"]) {
+    const source = read(relative);
+    const hint = source.match(/--model <([^>]+)>/);
+    assert.ok(hint, `${relative} does not advertise --model at all`);
+    const advertised = hint[1].split("|").filter((value) => value !== "model");
+    assert.deepEqual(
+      [...advertised].sort(),
+      [...aliases].sort(),
+      `${relative} advertises model aliases that do not match MODEL_ALIASES`
+    );
   }
 });
 

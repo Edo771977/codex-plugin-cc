@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
-argument-hint: "[--background|--wait] [--resume|--resume-thread <id>|--fresh|--ephemeral] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--sandbox <read-only|workspace-write|danger-full-access>] [--read-root <directory> ...] [what Codex should investigate, solve, or continue]"
+argument-hint: "[--background|--wait] [--resume|--resume-thread <id>|--fresh|--ephemeral] [--model <model|spark|sol|luna|astra>] [--effort <none|minimal|low|medium|high|xhigh>] [--sandbox <read-only|workspace-write|danger-full-access>] [--read-root <directory> ...] [what Codex should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -49,6 +49,7 @@ Operating rules:
 - Do not ask the subagent to inspect files, monitor progress, poll `/codex:status`, fetch `/codex:result`, call `/codex:cancel`, summarize output, or do follow-up work of its own.
 - Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
 - Leave the model unset unless the user explicitly asks for one. If they ask for `spark`, map it to `gpt-5.3-codex-spark`.
+- The plugin also accepts the short aliases `sol`, `luna` and `astra` and expands them to `gpt-6-sol`, `gpt-6-luna` and `gpt-6-astra`. Forward whichever the user typed; do not invent an alias they did not ask for.
 - Leave `--resume`, `--resume-thread <id>`, and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
 - If the helper reports that Codex is missing or unauthenticated, stop and tell the user to run `/codex:setup`.
 - If the user did not supply a request, ask what Codex should investigate or fix.

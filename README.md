@@ -24,7 +24,7 @@ they already have.
 
 | Command | What it does | Main flags |
 | --- | --- | --- |
-| [`/codex:review`](#codexreview) | read-only Codex review of your current work | `--wait`, `--background`, `--base <ref>`, `--scope <auto\|working-tree\|branch>`, `--model <model\|spark>`, `--effort <level>` |
+| [`/codex:review`](#codexreview) | read-only Codex review of your current work | `--wait`, `--background`, `--base <ref>`, `--scope <auto\|working-tree\|branch>`, `--model <model\|spark\|sol\|luna\|astra>`, `--effort <level>` |
 | [`/codex:adversarial-review`](#codexadversarial-review) | steerable review that challenges the approach | same as `/codex:review`, plus free-form focus text |
 | [`/codex:rescue`](#codexrescue) | delegate investigation or a fix to Codex | `--background`, `--wait`, `--resume`, `--resume-thread <id>`, `--fresh`, `--ephemeral`, `--model`, `--effort`, `--write`, `--sandbox <mode>`, `--read-root <dir>` |
 | [`/codex:transfer`](#codextransfer) | turn this Claude session into a resumable Codex thread | `--source <claude-jsonl>` |
@@ -140,7 +140,7 @@ Use it when you want:
 - a review of your current uncommitted changes
 - a review of your branch compared to a base branch like `main`
 
-Use `--base <ref>` for branch review. It also supports `--wait`, `--background`, `--scope <auto|working-tree|branch>`, and — like `/codex:rescue` — `--model <model|spark>` and `--effort <level>` to pick the reviewing model and how hard it thinks. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
+Use `--base <ref>` for branch review. It also supports `--wait`, `--background`, `--scope <auto|working-tree|branch>`, and — like `/codex:rescue` — `--model <model|spark|sol|luna|astra>` and `--effort <level>` to pick the reviewing model and how hard it thinks. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
 
 Examples:
 
@@ -160,7 +160,7 @@ Runs a **steerable** review that questions the chosen implementation and design.
 It can be used to pressure-test assumptions, tradeoffs, failure modes, and whether a different approach would have been safer or simpler.
 
 It uses the same review target selection as `/codex:review`, including `--base <ref>` for branch review.
-It also supports `--wait`, `--background`, `--model <model|spark>`, and `--effort <level>`. Unlike `/codex:review`, it can take extra focus text after the flags.
+It also supports `--wait`, `--background`, `--model <model|spark|sol|luna|astra>`, and `--effort <level>`. Unlike `/codex:review`, it can take extra focus text after the flags.
 
 Use it when you want:
 
@@ -192,7 +192,7 @@ Use it when you want Codex to:
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, `--resume-thread <id>`, `--fresh`, `--ephemeral`, `--model <model|spark>`, `--effort <level>`, `--write`, `--sandbox <read-only|workspace-write|danger-full-access>`, and repeatable `--read-root <directory>`. If you omit the resume flags, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--resume`, `--resume-thread <id>`, `--fresh`, `--ephemeral`, `--model <model|spark|sol|luna|astra>`, `--effort <level>`, `--write`, `--sandbox <read-only|workspace-write|danger-full-access>`, and repeatable `--read-root <directory>`. If you omit the resume flags, the plugin can offer to continue the latest rescue thread for this repo.
 
 Examples:
 
@@ -219,6 +219,7 @@ Ask Codex to redesign the database connection to be more resilient.
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
+- the GPT-6 models have short aliases too: `sol`, `luna` and `astra` map to `gpt-6-sol`, `gpt-6-luna` and `gpt-6-astra`. Aliases are case-insensitive and are expanded by the plugin on every command that takes `--model`, so a full slug and its alias behave identically. Any other value is forwarded to Codex verbatim
 - follow-up rescue requests can continue the latest Codex task in the repo
 - `--resume`/`--resume-last` continues the newest thread for this repository; `--resume-thread <id>` continues one specific thread (the id is printed by `/codex:status` and `/codex:result`). `--resume`, `--resume-thread`, and `--fresh` are mutually exclusive.
 - `--ephemeral` runs without persisting the Codex thread: nothing is added to Codex's Recent list, and there is no thread to come back to. Useful for disposable, fire-and-forget work — many parallel subtasks from an orchestrating agent, say — where the persistent threads are only noise. It is refused together with `--resume`, `--resume-last` and `--resume-thread`, an ephemeral run is never offered as a `--resume-last` candidate, and `/codex:status` and `/codex:result` stop printing a `codex resume` line for it. Without the flag nothing changes: threads persist exactly as before.
@@ -413,9 +414,9 @@ request reaches Codex.
 
 Two notes on the prompting skill, since it is the one that changes what you get:
 
-- its launch lines use full model slugs (`gpt-6-luna`, `gpt-6-sol`, `gpt-6-astra`). This fork maps
-  only one short alias, `spark` → `gpt-5.3-codex-spark`; every other `--model` value is forwarded to
-  Codex verbatim, so the slug is what works
+- its launch lines use full model slugs (`gpt-6-luna`, `gpt-6-sol`, `gpt-6-astra`). Those slugs also
+  have short aliases here (`luna`, `sol`, `astra`, plus `spark` → `gpt-5.3-codex-spark`), so either
+  form works; every other `--model` value is forwarded to Codex verbatim
 - it advises staying at `high` effort or below. That is advice about cost, not a limit: `--effort
   xhigh` is accepted. `max` and `ultra` are not
 - a test reads this fork's own model and effort validators and checks every `--model`/`--effort` the

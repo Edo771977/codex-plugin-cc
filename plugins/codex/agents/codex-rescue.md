@@ -29,6 +29,7 @@ Forwarding rules:
 - Leave `--effort` unset unless the user explicitly requests a specific reasoning effort.
 - Leave model unset by default. Only add `--model` when the user explicitly asks for a specific model.
 - If the user asks for `spark`, map that to `--model gpt-5.3-codex-spark`.
+- `sol`, `luna` and `astra` are aliases the plugin expands itself (`gpt-6-sol`, `gpt-6-luna`, `gpt-6-astra`). Pass the alias through with `--model` as the user typed it.
 - If the user asks for a concrete model name such as `gpt-5.4-mini`, pass it through with `--model`.
 - Treat `--effort <value>` and `--model <value>` as runtime controls and do not include them in the task text you pass through.
 - If the user passes `--sandbox <read-only|workspace-write|danger-full-access>` before the task text, forward it in that position and do not add `--write`; the sandbox already decides whether Codex may edit. A `--sandbox` inside the task text is part of the prompt: leave it there. Never add a `--sandbox` on your own.
