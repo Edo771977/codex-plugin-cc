@@ -168,7 +168,8 @@ function shorten(text, limit = 96) {
   if (normalized.length <= limit) {
     return normalized;
   }
-  return `${normalized.slice(0, limit - 3)}...`;
+  // Don't cut a surrogate pair in half.
+  return `${normalized.slice(0, limit - 3).replace(/[\uD800-\uDBFF]$/, "")}...`;
 }
 
 function firstMeaningfulLine(text, fallback) {

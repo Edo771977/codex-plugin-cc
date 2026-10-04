@@ -193,6 +193,30 @@ test("task runs without auth preflight so Codex can refresh an expired session",
   assert.match(result.stdout, /Handled the requested task/);
 });
 
+test("task does not split an emoji when shortening the prompt for the thread name and job summary", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  // The thread name keeps the first 53 UTF-16 code units of the prompt and the job summary
+  // the first 93, so put an emoji (a surrogate pair) across each cut.
+  const promptPath = path.join(repo, "prompt.txt");
+  fs.writeFileSync(promptPath, `${"a".repeat(52)}\u{1F534}${"b".repeat(38)}\u{1F534} review the change`, "utf8");
+
+  const result = run("node", [SCRIPT, "task", "--prompt-file", promptPath], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.threads[0].name, `Codex Companion Task: ${"a".repeat(52)}...`);
+  const stateDir = resolveStateDir(repo);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const job = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${state.jobs[0].id}.json`), "utf8"));
+  assert.equal(job.summary, `${"a".repeat(52)}\u{1F534}${"b".repeat(38)}...`);
+});
+
 test("transfer delegates the current Claude session directly to native import", () => {
   const home = makeTempDir();
   const repo = path.join(home, "repo");
