@@ -20,13 +20,13 @@ Execution rules:
 - That prompt drafting is the only Claude-side work allowed. Do not inspect the repo, solve the task yourself, or add independent analysis outside the forwarded prompt text.
 - Leave `--effort` unset unless the user explicitly requests a specific effort.
 - Leave model unset by default. Add `--model` only when the user explicitly asks for one.
-- Map `spark` to `--model gpt-5.3-codex-spark`.
+- `spark`, `sol`, `luna` and `astra` are short aliases the plugin expands itself, to `gpt-5.3-codex-spark`, `gpt-6-sol`, `gpt-6-luna` and `gpt-6-astra`. Pass whichever the user typed through unchanged; a full slug works too.
 - Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
 
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
-- If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
+- If the forwarded request includes `--model`, pass the value through to `task`. `spark`, `sol`, `luna` and `astra` are aliases the plugin expands; any other value reaches Codex verbatim.
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request carries `--sandbox` before the task text (alongside `--model`, `--effort`, `--resume` or `--fresh`), pass it through in that position and do not add `--write`. A `--sandbox` inside the task text is prompt text; leave it in place.
 - Preserve every `--read-root <directory>` pair, pass it through to `task`, and exclude both tokens from the natural-language task text. Each value must name an existing directory; files and missing paths fail before Codex starts.

@@ -61,8 +61,9 @@ Hand the job to Sol.
 
 ## Sol: implementation
 
-Launch: `--model gpt-6-sol --effort medium` (`high` for large multi-part work), with
-`--worktree-name <name>` when the main checkout must stay clean.
+Launch: `--model gpt-6-sol --effort medium` (`high` for large multi-part work). This
+plugin has no worktree flag: if the main checkout must stay clean, say so in the
+brief and name the branch or worktree Codex should create.
 
 ```xml
 <task>Repo: <absolute path>. Objective: <one sentence>. Numbered items, each
@@ -135,7 +136,7 @@ Then validate independently; do not trust Astra's own labels:
 
 For hard visual reconstruction, such as redrawing a sketch or screenshot as a
 Figma design, or other precise multi-step GUI work. Launch with `--model gpt-6-astra
---effort medium --full`. Include the target file or URL, the reference image
+--effort medium`. Include the target file or URL, the reference image
 paths, a definition of done ("every element in the reference exists with
 matching position ±8px and matching text"), `<stop_rules>`, and evidence rules
 (save screenshots to `.codex-artifacts/<job-id>/`). Routine browser QA belongs
