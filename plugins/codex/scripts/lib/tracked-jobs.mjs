@@ -317,6 +317,114 @@ export function claimTerminalStatus(workspaceRoot, jobId, intent = "cancel") {
   }
 }
 
+/**
+ * Make the worker's own death explain itself.
+ *
+ * A job record is only ever written by the process running the job, so a worker that is killed
+ * (a Claude Code Bash timeout, a session ending, an operator), crashes, or drains its event loop
+ * without the turn ever settling leaves the record at "running" with nobody left to correct it.
+ * Reconciliation repairs that on the next read, but only after the fact and only as "its worker
+ * is gone". These handlers record the failure while the process is still alive to say why.
+ *
+ * A cancellation still wins: the terminal claim decides, exactly as in the normal paths.
+ */
+export function registerWorkerGuards(job, record, options = {}) {
+  const { workspaceRoot, id: jobId } = job;
+  const exitImpl = options.exitImpl ?? ((code) => process.exit(code));
+  const emitter = options.processImpl ?? process;
+  let active = true;
+
+  const failIfActive = (message) => {
+    if (!active) {
+      return false;
+    }
+    try {
+      const existing = readStoredJobOrNull(workspaceRoot, jobId) ?? record;
+      if (TERMINAL_JOB_STATUSES.has(existing.status)) {
+        return false;
+      }
+      if (isJobCancelled(workspaceRoot, jobId) || !claimTerminalStatus(workspaceRoot, jobId, "worker")) {
+        reassertTerminalClaim(workspaceRoot, jobId, existing);
+        return false;
+      }
+      active = false;
+      const completedAt = nowIso();
+      writeJobFile(workspaceRoot, jobId, {
+        ...existing,
+        status: "failed",
+        phase: "failed",
+        pid: null,
+        errorMessage: message,
+        completedAt
+      });
+      upsertJob(workspaceRoot, {
+        id: jobId,
+        status: "failed",
+        phase: "failed",
+        pid: null,
+        errorMessage: message,
+        completedAt
+      });
+      return true;
+    } catch {
+      // Bookkeeping must never be what takes the process down; reconciliation remains the
+      // backstop for exactly this case.
+      return false;
+    }
+  };
+
+  // SIGHUP and SIGTERM do not exist as deliverable signals on Windows; SIGBREAK does.
+  const signalNames = process.platform === "win32" ? ["SIGINT", "SIGBREAK"] : ["SIGTERM", "SIGINT", "SIGHUP"];
+  const signalHandlers = new Map();
+  for (const signalName of signalNames) {
+    const handler = () => {
+      failIfActive(
+        `Codex job ${jobId} was stopped by ${signalName} before Codex finished, so no result was recorded.`
+      );
+      exitImpl(128 + (signalName === "SIGINT" ? 2 : signalName === "SIGHUP" ? 1 : 15));
+    };
+    signalHandlers.set(signalName, handler);
+    try {
+      emitter.on(signalName, handler);
+    } catch {
+      // A platform that refuses to listen for one of these keeps the others.
+    }
+  }
+
+  const onBeforeExit = () => {
+    // The event loop drained with the job still active: the connection to Codex went away
+    // without anything rejecting the pending turn. Exiting 0 here would leave a record that
+    // says "running" behind a process that is already gone.
+    if (
+      failIfActive(
+        `Codex job ${jobId} lost its connection to the Codex app-server before the turn completed, so no result was recorded.`
+      )
+    ) {
+      process.exitCode = 1;
+    }
+  };
+  const onCrash = (error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    failIfActive(`Codex job ${jobId} crashed before Codex finished: ${message}`);
+    process.stderr.write(`${message}\n`);
+    exitImpl(1);
+  };
+
+  emitter.on("beforeExit", onBeforeExit);
+  emitter.on("uncaughtException", onCrash);
+  emitter.on("unhandledRejection", onCrash);
+
+  return () => {
+    active = false;
+    for (const [signalName, handler] of signalHandlers) {
+      emitter.off(signalName, handler);
+    }
+    emitter.off("beforeExit", onBeforeExit);
+    emitter.off("uncaughtException", onCrash);
+    emitter.off("unhandledRejection", onCrash);
+  };
+}
+
 export async function runTrackedJob(job, runner, options = {}) {
   // A cancellation may have been recorded before the worker got this far
   // (e.g. cancel raced worker startup); never resurrect a cancelled job. A
@@ -349,6 +457,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     throw new Error(`Job ${job.id} was cancelled before it started.`);
   }
 
+  const releaseWorkerGuards = registerWorkerGuards(job, runningRecord);
   try {
     const execution = await runner();
     // Cancellation is terminal: if it was recorded while the turn was
@@ -424,5 +533,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       completedAt
     });
     throw error;
+  } finally {
+    releaseWorkerGuards();
   }
 }
