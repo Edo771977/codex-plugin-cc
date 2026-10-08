@@ -19,6 +19,10 @@
 - Replace the internal `gpt-5-4-prompting` skill with `gpt-6-prompting`: GPT-6 brief blocks (autonomy, repo policy, verification states, progress updates, output contracts) and per-model recipes for Luna, Sol and Astra (openai/codex-plugin-cc#784, skill commit only). Its launch lines use full model slugs and its effort note matches this fork's validators.
 - Add short model aliases for the GPT-6 models: `sol`, `luna` and `astra` expand to `gpt-6-sol`, `gpt-6-luna` and `gpt-6-astra`, alongside the existing `spark`. Aliases are now expanded on `review` and `adversarial-review` as well, which previously forwarded the raw `--model` value to Codex.
 
+- Signal the pid itself when the process-group SIGTERM fails with ESRCH, so a process that does not lead its own process group still gets the graceful stop instead of only the later force kill (openai/codex-plugin-cc#787).
+- Name a delegated thread after the `<task>` block of a structured prompt, so threads shaped by the prompting skill can be told apart in Codex's list instead of all reading "Codex Companion Task: <task> …" (openai/codex-plugin-cc#792).
+- Stop cutting a surrogate pair in half when shortening a thread name or job summary: a lone surrogate made the app-server drop the request (openai/codex-plugin-cc#800).
+
 ## 1.0.0
 
 - Initial version of the Codex plugin for Claude Code
