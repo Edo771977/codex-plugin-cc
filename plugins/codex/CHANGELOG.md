@@ -22,6 +22,7 @@
 - Signal the pid itself when the process-group SIGTERM fails with ESRCH, so a process that does not lead its own process group still gets the graceful stop instead of only the later force kill (openai/codex-plugin-cc#787).
 - Name a delegated thread after the `<task>` block of a structured prompt, so threads shaped by the prompting skill can be told apart in Codex's list instead of all reading "Codex Companion Task: <task> …" (openai/codex-plugin-cc#792).
 - Stop cutting a surrogate pair in half when shortening a thread name or job summary: a lone surrogate made the app-server drop the request (openai/codex-plugin-cc#800).
+- Tell the review commands not to read or wait for the background command's output at all, rather than naming `BashOutput` as the one thing not to call, and restate the result-handling stop rule without the shouting: present the findings, ask which to fix, edit nothing until the user picks (openai/codex-plugin-cc#799).
 
 ## 1.0.0
 

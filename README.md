@@ -474,6 +474,7 @@ Commands and flags:
 | [#737](https://github.com/openai/codex-plugin-cc/pull/737) | hooks resolve Node through `scripts/run-node.sh`, so nvm/fnm/asdf/mise/Volta/Homebrew toolchains work under the minimal hook PATH |
 | [#747](https://github.com/openai/codex-plugin-cc/pull/747) | `runCommand` sets an explicit 256 MiB `maxBuffer`, so a large `git diff` is no longer truncated at Node's 1 MiB default |
 | [#763](https://github.com/openai/codex-plugin-cc/pull/763) | a turn that fails without throwing stores its error text, so `/codex:result` says why it failed |
+| [#799](https://github.com/openai/codex-plugin-cc/pull/799) | the review commands forbid reading or waiting for the background command's output, instead of naming one tool (`BashOutput`) that was only one way to do it; the result-handling skill's stop rule keeps its substance and loses the shouting |
 
 Where two of these PRs disagreed, the merge commit says which side won and why. The plugin version
 is deliberately left at the upstream number: these merges do not cut a release.
