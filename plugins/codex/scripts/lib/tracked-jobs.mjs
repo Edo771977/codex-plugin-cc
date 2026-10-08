@@ -3,11 +3,24 @@ import process from "node:process";
 
 import { writePrivateFile } from "./fs.mjs";
 import { isPidAlive } from "./process.mjs";
-import { loadState, readJobFile, resolveJobClaimFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { workerHeartbeatIntervalMs } from "./lifecycle-limits.mjs";
+import {
+  loadState,
+  patchJobFileIfActive,
+  readJobFile,
+  resolveJobClaimFile,
+  resolveJobFile,
+  resolveJobLogFile,
+  upsertJob,
+  writeJobFile
+} from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
 const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+/** Progress events can arrive in bursts; one activity stamp per window is enough. */
+const ACTIVITY_WRITE_THROTTLE_MS = 5000;
 
 export function nowIso() {
   return new Date().toISOString();
@@ -75,6 +88,27 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
   let lastThreadId = null;
   let lastTurnId = null;
+  let lastActivityWriteAt = 0;
+
+  /**
+   * Every progress event proves Codex is still producing output, including the ones that change
+   * nothing else. `/codex:status` reads this to tell a long think apart from a wedged run.
+   * Advisory, throttled, and never allowed to revive a record that has settled.
+   */
+  const touchActivity = () => {
+    const now = Date.now();
+    if (now - lastActivityWriteAt < ACTIVITY_WRITE_THROTTLE_MS) {
+      return;
+    }
+    lastActivityWriteAt = now;
+    try {
+      if (!terminalClaimTaken(workspaceRoot, jobId)) {
+        patchJobFileIfActive(workspaceRoot, jobId, { lastActivityAt: new Date(now).toISOString() });
+      }
+    } catch {
+      // Picked up again by the next event or heartbeat.
+    }
+  };
 
   return (event) => {
     const normalized = normalizeProgressEvent(event);
@@ -98,6 +132,8 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       patch.turnId = normalized.turnId;
       changed = true;
     }
+
+    touchActivity();
 
     if (!changed) {
       return;
@@ -414,8 +450,31 @@ export function registerWorkerGuards(job, record, options = {}) {
   emitter.on("uncaughtException", onCrash);
   emitter.on("unhandledRejection", onCrash);
 
+  // A pid is not proof of life — the operating system reuses them, so a record left behind by a
+  // dead worker can point at an unrelated live process and read as healthy forever. A stamp the
+  // worker refreshes while it runs is what makes that distinguishable.
+  const heartbeatIntervalMs = options.heartbeatIntervalMs ?? workerHeartbeatIntervalMs();
+  const writeHeartbeat = () => {
+    try {
+      patchJobFileIfActive(workspaceRoot, jobId, { heartbeatAt: nowIso() });
+    } catch {
+      // Heartbeats are advisory: never let one fail the run it is describing.
+    }
+  };
+  let heartbeatTimer = null;
+  if (heartbeatIntervalMs) {
+    writeHeartbeat();
+    heartbeatTimer = setInterval(writeHeartbeat, heartbeatIntervalMs);
+    // Never hold the event loop open on the heartbeat alone.
+    heartbeatTimer.unref?.();
+  }
+
   return () => {
     active = false;
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
     for (const [signalName, handler] of signalHandlers) {
       emitter.off(signalName, handler);
     }

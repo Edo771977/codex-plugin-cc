@@ -444,6 +444,37 @@ export function readJobFile(jobFile) {
   return JSON.parse(fs.readFileSync(jobFile, "utf8"));
 }
 
+/**
+ * Merge `patch` into a job file that is still active, under the state lock.
+ *
+ * For advisory bookkeeping a worker writes about itself — a heartbeat, a last-activity stamp —
+ * where losing a write costs nothing but reviving a finished job costs the user a lie. A missing
+ * file and a terminal status are both left alone, and the terminal check is re-read inside the
+ * lock so a record that settled while this call waited is not overwritten.
+ *
+ * @returns {boolean} whether the patch was written.
+ */
+export function patchJobFileIfActive(cwd, jobId, patch) {
+  const jobFile = resolveJobFile(cwd, jobId);
+  return withLockSync(resolveStateLockDir(cwd), () => {
+    if (!fs.existsSync(jobFile)) {
+      return false;
+    }
+    let stored = null;
+    try {
+      stored = readJobFile(jobFile);
+    } catch {
+      // A torn or unreadable record is not something advisory bookkeeping should repair.
+      return false;
+    }
+    if (!isActiveJob(stored)) {
+      return false;
+    }
+    writeJsonFileAtomic(jobFile, { ...stored, ...patch });
+    return true;
+  });
+}
+
 export function resolveJobLogFile(cwd, jobId) {
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.log`);

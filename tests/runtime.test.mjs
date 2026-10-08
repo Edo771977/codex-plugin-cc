@@ -180,6 +180,41 @@ test("task runs when the active provider does not require OpenAI login", () => {
   assert.match(result.stdout, /Handled the requested task/);
 });
 
+test("a running worker keeps refreshing a heartbeat on its job record", async () => {
+  // A pid cannot answer "is our worker still alive" because pids are reused. The heartbeat can,
+  // and only if it is actually refreshed while the run continues.
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "turn-never-completes");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_HEARTBEAT_INTERVAL_MS: "200" };
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "take your time"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+
+  const jobFile = path.join(resolveStateDir(repo), "jobs", `${jobId}.json`);
+  const first = await waitFor(() => {
+    const job = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+    return job.heartbeatAt ?? null;
+  }, { timeoutMs: 60000 });
+
+  // Refreshed, not written once at startup.
+  await waitFor(() => {
+    const job = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+    return job.heartbeatAt && job.heartbeatAt !== first ? job.heartbeatAt : null;
+  }, { timeoutMs: 60000 });
+
+  const cancelled = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+});
+
 test("a task fails fast and the broker leaves when the shared app-server dies mid-turn", async () => {
   // A broker in front of a dead app-server keeps accepting connections, so the turn it was
   // streaming never completes and every later command connects to a runtime with no backend.

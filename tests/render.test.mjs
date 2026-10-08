@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { renderCancelReport, renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+import {
+  renderCancelReport,
+  renderJobStatusReport,
+  renderReviewResult,
+  renderStoredJobResult
+} from "../plugins/codex/scripts/lib/render.mjs";
 
 test("renderCancelReport reports a non-cancelled adopted outcome instead of a cancel stub", () => {
   const failed = renderCancelReport({ id: "task-1", title: "Codex Task", status: "failed" });
@@ -75,4 +80,21 @@ test("renderStoredJobResult prefers rendered output for structured review jobs",
   assert.doesNotMatch(output, /^\{/);
   assert.match(output, /Codex session ID: thr_123/);
   assert.match(output, /Resume in Codex: codex resume thr_123/);
+});
+
+test("renderJobStatusReport says a live run has gone quiet without calling it failed", () => {
+  const rendered = renderJobStatusReport({
+    id: "task-quiet",
+    status: "running",
+    phase: "editing",
+    kindLabel: "rescue",
+    stalled: true,
+    quietFor: "24m 12s",
+    threadId: "thr_1"
+  });
+
+  assert.match(rendered, /Possibly stalled: no Codex output for 24m 12s/);
+  // Still running: nothing here may read as a verdict on the job.
+  assert.match(rendered, /running/);
+  assert.doesNotMatch(rendered, /failed/i);
 });

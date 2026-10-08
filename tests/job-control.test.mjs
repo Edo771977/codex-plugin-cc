@@ -70,6 +70,81 @@ test("reconcileJobLiveness keeps the turn-start response window active", () => {
   assert.equal(job.workerExited, true);
 });
 
+test("reconcileJobLiveness treats a live pid with a stale heartbeat as a lost worker", () => {
+  // Pids are reused: a record left by a dead worker can point at an unrelated live process and
+  // read as healthy forever. The heartbeat is what separates the two.
+  const now = Date.parse("2026-01-01T00:20:00.000Z");
+  const job = reconcileJobLiveness(
+    activeJob({ threadId: "thr_1", heartbeatAt: "2026-01-01T00:00:00.000Z" }),
+    { killImpl() {}, now, env: {} }
+  );
+
+  assert.equal(job.phase, "worker-exited-turn-unknown");
+  assert.equal(job.workerExited, true);
+  assert.equal(job.pid, null);
+});
+
+test("reconcileJobLiveness keeps a live worker whose heartbeat is fresh", () => {
+  const now = Date.parse("2026-01-01T00:00:30.000Z");
+  const job = reconcileJobLiveness(
+    activeJob({ threadId: "thr_1", heartbeatAt: "2026-01-01T00:00:00.000Z" }),
+    { killImpl() {}, now, env: {} }
+  );
+
+  assert.equal(job.status, "running");
+  assert.equal(job.phase, "editing");
+  assert.equal(job.workerExited, undefined);
+});
+
+test("reconcileJobLiveness ignores heartbeats on a record that has none", () => {
+  // A job started before heartbeats existed, or one whose worker has not reached its first
+  // stamp, is not evidence of anything — it must not be failed on a missing field.
+  const job = reconcileJobLiveness(activeJob({ threadId: "thr_1", startedAt: "2026-01-01T00:00:00.000Z" }), {
+    killImpl() {},
+    now: Date.parse("2026-01-01T05:00:00.000Z"),
+    env: { CODEX_COMPANION_STALL_AFTER_MS: "0" }
+  });
+
+  assert.equal(job.status, "running");
+  assert.equal(job.workerExited, undefined);
+});
+
+test("reconcileJobLiveness flags a quiet live run as possibly stalled without failing it", () => {
+  const now = Date.parse("2026-01-01T00:30:00.000Z");
+  const job = reconcileJobLiveness(
+    activeJob({
+      threadId: "thr_1",
+      heartbeatAt: "2026-01-01T00:29:55.000Z",
+      lastActivityAt: "2026-01-01T00:05:00.000Z"
+    }),
+    { killImpl() {}, now, env: {} }
+  );
+
+  assert.equal(job.status, "running");
+  assert.equal(job.stalled, true);
+  assert.ok(job.quietForMs >= 25 * 60 * 1000);
+});
+
+test("reconcileJobLiveness leaves a recently active run unflagged, and honours a disabled threshold", () => {
+  const base = {
+    threadId: "thr_1",
+    heartbeatAt: "2026-01-01T00:29:55.000Z",
+    lastActivityAt: "2026-01-01T00:29:00.000Z"
+  };
+  const now = Date.parse("2026-01-01T00:30:00.000Z");
+  assert.equal(reconcileJobLiveness(activeJob(base), { killImpl() {}, now, env: {} }).stalled, undefined);
+
+  const quiet = { ...base, lastActivityAt: "2026-01-01T00:00:00.000Z" };
+  assert.equal(
+    reconcileJobLiveness(activeJob(quiet), {
+      killImpl() {},
+      now,
+      env: { CODEX_COMPANION_STALL_AFTER_MS: "0" }
+    }).stalled,
+    undefined
+  );
+});
+
 test("reconcileJobLiveness treats EPERM as alive", () => {
   const original = activeJob();
   const job = reconcileJobLiveness(original, {

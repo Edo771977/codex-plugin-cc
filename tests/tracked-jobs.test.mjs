@@ -336,7 +336,7 @@ test("progress updates do not touch a job that already reached a terminal status
 // the same code paths deterministic.
 import { EventEmitter } from "node:events";
 
-function armedJob(id) {
+function armedJob(id, options = {}) {
   const workspaceRoot = makeTempDir();
   const job = { id, workspaceRoot, title: "Codex Task" };
   const record = { ...job, status: "running", phase: "editing", pid: 4242 };
@@ -346,7 +346,9 @@ function armedJob(id) {
   const exits = [];
   const release = registerWorkerGuards(job, record, {
     processImpl: emitter,
-    exitImpl: (code) => exits.push(code)
+    exitImpl: (code) => exits.push(code),
+    // Off unless a test asks for it: the other guard tests must not depend on a timer.
+    heartbeatIntervalMs: options.heartbeatIntervalMs ?? 0
   });
   return { workspaceRoot, job, record, emitter, exits, release };
 }
@@ -409,4 +411,28 @@ test("a released guard is inert", () => {
   const stored = readJobFile(resolveJobFile(workspaceRoot, job.id));
   assert.equal(stored.status, "running");
   assert.deepEqual(exits, []);
+});
+
+test("the guards stamp a heartbeat immediately and keep refreshing it", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "Date"] });
+  const { workspaceRoot, job, release } = armedJob("task-heartbeat", { heartbeatIntervalMs: 1000 });
+
+  // Written at arm time, not only on the first tick: a worker killed in its first second still
+  // has to be distinguishable from one that never started.
+  const first = readJobFile(resolveJobFile(workspaceRoot, job.id)).heartbeatAt;
+  assert.ok(first, "no heartbeat was written when the guards were armed");
+
+  t.mock.timers.tick(1000);
+  const second = readJobFile(resolveJobFile(workspaceRoot, job.id)).heartbeatAt;
+  assert.notEqual(second, first);
+
+  release();
+  t.mock.timers.tick(5000);
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).heartbeatAt, second, "a released guard kept stamping");
+});
+
+test("a zero heartbeat interval disables the stamp entirely", () => {
+  const { workspaceRoot, job, release } = armedJob("task-heartbeat-off", { heartbeatIntervalMs: 0 });
+  release();
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).heartbeatAt, undefined);
 });
