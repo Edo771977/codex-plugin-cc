@@ -728,9 +728,10 @@ export async function captureTurn(client, threadId, startRequest, options = {}) 
     // (broker shutdown, app-server crash), no `turn/completed` will ever come,
     // so fail fast instead of waiting forever on a dead connection.
     const connectionClosed = client.exitPromise.then(() => {
-      // A clean close can outrun the 250 ms inferred-completion timer; if the
-      // final answer already arrived and no subagent work is pending, the
-      // turn is done — don't turn a finished run into a transport failure.
+      // A clean close can outrun the 250 ms inferred-completion timer; if the final answer already
+      // arrived and no subagent work is pending, the turn is done — don't turn a finished run into
+      // a transport failure. A close that *reports* something is different: that error is the
+      // answer, and swallowing it would hide a half-delivered turn.
       if (
         !client.exitError &&
         !state.completed &&

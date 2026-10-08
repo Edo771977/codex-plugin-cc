@@ -180,6 +180,34 @@ test("task runs when the active provider does not require OpenAI login", () => {
   assert.match(result.stdout, /Handled the requested task/);
 });
 
+test("a task fails fast and the broker leaves when the shared app-server dies mid-turn", async () => {
+  // A broker in front of a dead app-server keeps accepting connections, so the turn it was
+  // streaming never completes and every later command connects to a runtime with no backend.
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "crash-mid-turn");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = buildEnv(binDir);
+
+  const result = run("node", [SCRIPT, "task", "do something"], { cwd: repo, env });
+  assert.notEqual(result.status, 0);
+  // The reason has to name the app-server, not just "connection closed": the broker passes its
+  // own exit detail to the client before the socket goes away.
+  assert.match(result.stderr, /app-server exited/i);
+
+  // No zombie runtime left behind: the session record and its endpoint are gone.
+  await waitFor(() => loadBrokerSession(repo) === null, { timeoutMs: 10000, intervalMs: 100 });
+
+  // And the next command recovers on a fresh runtime instead of hanging on the dead one.
+  installFakeCodex(binDir);
+  const recovered = run("node", [SCRIPT, "task", "try again"], { cwd: repo, env });
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.match(recovered.stdout, /Handled the requested task/);
+});
+
 test("task survives fileChange started items that omit changes", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
