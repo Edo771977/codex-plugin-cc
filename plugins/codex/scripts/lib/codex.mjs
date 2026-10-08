@@ -197,7 +197,8 @@ function shorten(text, limit = 72) {
   if (normalized.length <= limit) {
     return normalized;
   }
-  return `${normalized.slice(0, limit - 3)}...`;
+  // Don't cut a surrogate pair in half: app-server drops a request whose JSON has a lone surrogate.
+  return `${normalized.slice(0, limit - 3).replace(/[\uD800-\uDBFF]$/, "")}...`;
 }
 
 function looksLikeVerificationCommand(command) {
