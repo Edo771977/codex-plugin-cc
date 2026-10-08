@@ -23,6 +23,10 @@
 - Name a delegated thread after the `<task>` block of a structured prompt, so threads shaped by the prompting skill can be told apart in Codex's list instead of all reading "Codex Companion Task: <task> …" (openai/codex-plugin-cc#792).
 - Stop cutting a surrogate pair in half when shortening a thread name or job summary: a lone surrogate made the app-server drop the request (openai/codex-plugin-cc#800).
 - Tell the review commands not to read or wait for the background command's output at all, rather than naming `BashOutput` as the one thing not to call, and restate the result-handling stop rule without the shouting: present the findings, ask which to fix, edit nothing until the user picks (openai/codex-plugin-cc#799).
+- Shut the shared broker down when its own app-server exits, and when that exit reported a failure tell every connected client why, so a streaming turn fails with a reason instead of waiting forever and later commands start a fresh runtime instead of hanging on a dead one. A clean exit stays silent, which is what keeps a run whose final answer already arrived from being failed (adapted from openai/codex-plugin-cc#797).
+- Fail a request whose write can no longer reach the runtime, rather than leaving it pending with nothing left to reject it, and stop an `EPIPE` on a dead child's stdin from taking the companion down with it (adapted from openai/codex-plugin-cc#797).
+- Record the failure from inside the worker when it is stopped by a signal, crashes, or drains its event loop with the turn unsettled — with the reason, and without overriding a cancellation that owns the terminal status (adapted from openai/codex-plugin-cc#797).
+- Refresh a heartbeat on a running job's record, so a worker that died cannot read as alive because its pid was reused, and flag a live run that has gone quiet as possibly stalled in `/codex:status` without ever failing it on that alone. Tunable through `CODEX_COMPANION_HEARTBEAT_INTERVAL_MS`, `CODEX_COMPANION_HEARTBEAT_STALE_MS` and `CODEX_COMPANION_STALL_AFTER_MS` (adapted from openai/codex-plugin-cc#797).
 
 ## 1.0.0
 
