@@ -940,7 +940,12 @@ async function main() {
   // later command connects to a runtime with no backend. Say why, close the endpoint so the
   // next command starts a fresh one, and leave.
   void appClient.exitPromise.then(async () => {
-    if (shuttingDown) {
+    // Stay out of a shutdown that is already in flight, including the window before `runShutdown`
+    // sets the flag: whoever asked for that one owns both its acknowledgement and the exit, and
+    // exiting from here could cut the ack short — a client that asked the broker to shut down and
+    // got no reply cannot prove it owned the broker, and reports that instead of a clean session
+    // end. The process is leaving either way.
+    if (shuttingDown || shutdownPromise) {
       return;
     }
     // Only a failure has something to report. An app-server that exited cleanly (it can do that
