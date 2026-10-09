@@ -452,7 +452,15 @@ rl.on("line", (line) => {
 	          prompt
 	        };
 	        saveState(state);
-	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+        if (BEHAVIOR === "missing-turn-id-with-early-event") {
+          // Simulate a notification sent before the turn/start response.
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+        }
+        if (BEHAVIOR === "missing-turn-id" || BEHAVIOR === "missing-turn-id-with-early-event") {
+          send({ id: message.id, result: { turn: { status: "inProgress", items: [] } } });
+        } else {
+          send({ id: message.id, result: { turn: buildTurn(turnId) } });
+        }
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
@@ -585,7 +593,17 @@ rl.on("line", (line) => {
           }
         ];
 
-	        if (BEHAVIOR === "interruptible-slow-task") {
+        if (BEHAVIOR === "missing-turn-id" || BEHAVIOR === "missing-turn-id-with-early-event") {
+          // The remaining notifications arrive after turn/start resolves.
+          setTimeout(() => {
+            for (const entry of items) {
+              if (entry.completed) {
+                send({ method: "item/completed", params: { threadId: thread.id, turnId, item: entry.completed } });
+              }
+            }
+            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+          }, 60);
+        } else if (BEHAVIOR === "interruptible-slow-task") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
 	            if (!interruptibleTurns.has(turnId)) {

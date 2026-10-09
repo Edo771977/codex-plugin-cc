@@ -559,9 +559,12 @@ function applyTurnNotification(state, message) {
 async function captureTurn(client, threadId, startRequest, options = {}) {
   const state = createTurnCaptureState(threadId, options);
   const previousHandler = client.notificationHandler;
+  let startResponded = false;
 
   client.setNotificationHandler((message) => {
-    if (!state.turnId) {
+    // A turn/start response may omit turn.id. Buffer only until the start
+    // request settles, not until a turn ID happens to become available.
+    if (!startResponded) {
       state.bufferedNotifications.push(message);
       return;
     }
@@ -598,6 +601,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
       }
     }
     state.bufferedNotifications.length = 0;
+    startResponded = true;
 
     if (response.turn?.status && response.turn.status !== "inProgress") {
       completeTurn(state, response.turn);
