@@ -5,7 +5,11 @@ import path from "node:path";
 import process from "node:process";
 
 import { parseArgs } from "./lib/args.mjs";
-import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
+import {
+  BROKER_APP_SERVER_EXITED_METHOD,
+  BROKER_BUSY_RPC_CODE,
+  CodexAppServerClient
+} from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 import { ensurePrivateDir, writePrivateFile } from "./lib/fs.mjs";
 import {
@@ -930,6 +934,33 @@ async function main() {
       process.exit(0);
     });
   }
+
+  // The broker in front of a dead app-server is worse than no broker: it keeps accepting
+  // connections, so a client streaming a turn waits for events that will never come and every
+  // later command connects to a runtime with no backend. Say why, close the endpoint so the
+  // next command starts a fresh one, and leave.
+  void appClient.exitPromise.then(async () => {
+    // Stay out of a shutdown that is already in flight, including the window before `runShutdown`
+    // sets the flag: whoever asked for that one owns both its acknowledgement and the exit, and
+    // exiting from here could cut the ack short — a client that asked the broker to shut down and
+    // got no reply cannot prove it owned the broker, and reports that instead of a clean session
+    // end. The process is leaving either way.
+    if (shuttingDown || shutdownPromise) {
+      return;
+    }
+    // Only a failure has something to report. An app-server that exited cleanly (it can do that
+    // right after delivering a final answer) must stay a clean close for its client: inventing a
+    // reason here would fail a run whose answer already arrived.
+    const detail = appClient.exitError?.message ?? null;
+    if (detail) {
+      process.stderr.write(`${detail}\n`);
+      for (const socket of sockets) {
+        send(socket, { method: BROKER_APP_SERVER_EXITED_METHOD, params: { message: detail } });
+      }
+    }
+    await shutdown(server).catch(() => {});
+    process.exit(detail ? 1 : 0);
+  });
 
   // Startup is over once we are accepting; from here the idle timer takes over. A broker nobody
   // ever connects to must not linger either, so arm it immediately.

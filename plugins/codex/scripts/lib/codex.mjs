@@ -197,7 +197,8 @@ function shorten(text, limit = 72) {
   if (normalized.length <= limit) {
     return normalized;
   }
-  return `${normalized.slice(0, limit - 3)}...`;
+  // Don't cut a surrogate pair in half: app-server drops a request whose JSON has a lone surrogate.
+  return `${normalized.slice(0, limit - 3).replace(/[\uD800-\uDBFF]$/, "")}...`;
 }
 
 function looksLikeVerificationCommand(command) {
@@ -206,8 +207,16 @@ function looksLikeVerificationCommand(command) {
   );
 }
 
+// Prompts shaped by the gpt-6-prompting skill carry the job in a `<task>` block,
+// often after other instructions, so name the thread after that block when present.
+function taskThreadNameSource(prompt) {
+  const text = String(prompt ?? "");
+  const taskBlock = /<task>([\s\S]*?)(?:<\/task>|$)/.exec(text)?.[1];
+  return taskBlock?.trim() ? taskBlock : text;
+}
+
 function buildTaskThreadName(prompt) {
-  const excerpt = shorten(prompt, 56);
+  const excerpt = shorten(taskThreadNameSource(prompt), 56);
   return excerpt ? `${TASK_THREAD_PREFIX}: ${excerpt}` : TASK_THREAD_PREFIX;
 }
 
@@ -719,9 +728,10 @@ export async function captureTurn(client, threadId, startRequest, options = {}) 
     // (broker shutdown, app-server crash), no `turn/completed` will ever come,
     // so fail fast instead of waiting forever on a dead connection.
     const connectionClosed = client.exitPromise.then(() => {
-      // A clean close can outrun the 250 ms inferred-completion timer; if the
-      // final answer already arrived and no subagent work is pending, the
-      // turn is done — don't turn a finished run into a transport failure.
+      // A clean close can outrun the 250 ms inferred-completion timer; if the final answer already
+      // arrived and no subagent work is pending, the turn is done — don't turn a finished run into
+      // a transport failure. A close that *reports* something is different: that error is the
+      // answer, and swallowing it would hide a half-delivered turn.
       if (
         !client.exitError &&
         !state.completed &&

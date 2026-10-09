@@ -783,6 +783,21 @@ rl.on("line", (line) => {
           }
         ];
 
+	        if (BEHAVIOR === "crash-mid-turn") {
+	          // The codex app-server dies while a turn is in flight.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          setTimeout(() => process.exit(1), 200);
+	          break;
+	        }
+
+	        if (BEHAVIOR === "turn-never-completes") {
+	          // A turn that stays open until something stops it. The interruptible-slow-task
+	          // behavior finishes on its own after 5s, which turns any test that needs the run to
+	          // still be in flight into a race it loses under load.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          break;
+	        }
+
 	        if (BEHAVIOR === "interruptible-slow-task" || BEHAVIOR === "interrupt-hang" || BEHAVIOR === "no-turn-started") {
 	          if (BEHAVIOR !== "no-turn-started") {
 	            send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });

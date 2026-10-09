@@ -180,6 +180,69 @@ test("task runs when the active provider does not require OpenAI login", () => {
   assert.match(result.stdout, /Handled the requested task/);
 });
 
+test("a running worker keeps refreshing a heartbeat on its job record", async () => {
+  // A pid cannot answer "is our worker still alive" because pids are reused. The heartbeat can,
+  // and only if it is actually refreshed while the run continues.
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "turn-never-completes");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_HEARTBEAT_INTERVAL_MS: "200" };
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "take your time"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+
+  const jobFile = path.join(resolveStateDir(repo), "jobs", `${jobId}.json`);
+  const first = await waitFor(() => {
+    const job = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+    return job.heartbeatAt ?? null;
+  }, { timeoutMs: 60000 });
+
+  // Refreshed, not written once at startup.
+  await waitFor(() => {
+    const job = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+    return job.heartbeatAt && job.heartbeatAt !== first ? job.heartbeatAt : null;
+  }, { timeoutMs: 60000 });
+
+  const cancelled = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+});
+
+test("a task fails fast and the broker leaves when the shared app-server dies mid-turn", async () => {
+  // A broker in front of a dead app-server keeps accepting connections, so the turn it was
+  // streaming never completes and every later command connects to a runtime with no backend.
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "crash-mid-turn");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = buildEnv(binDir);
+
+  const result = run("node", [SCRIPT, "task", "do something"], { cwd: repo, env });
+  assert.notEqual(result.status, 0);
+  // The reason has to name the app-server, not just "connection closed": the broker passes its
+  // own exit detail to the client before the socket goes away.
+  assert.match(result.stderr, /app-server exited/i);
+
+  // No zombie runtime left behind: the session record and its endpoint are gone.
+  await waitFor(() => loadBrokerSession(repo) === null, { timeoutMs: 10000, intervalMs: 100 });
+
+  // And the next command recovers on a fresh runtime instead of hanging on the dead one.
+  installFakeCodex(binDir);
+  const recovered = run("node", [SCRIPT, "task", "try again"], { cwd: repo, env });
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.match(recovered.stdout, /Handled the requested task/);
+});
+
 test("task survives fileChange started items that omit changes", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -199,6 +262,54 @@ test("task survives fileChange started items that omit changes", () => {
   assert.doesNotMatch(result.stderr, /Cannot read properties of undefined/);
 });
 
+test("task names the thread after the <task> block of a structured prompt", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const promptPath = path.join(repo, "prompt.txt");
+  fs.writeFileSync(
+    promptPath,
+    [
+      "Stay read-only.",
+      "<task>",
+      "Fix the flaky login test",
+      "</task>",
+      "<structured_output_contract>",
+      "Return a numbered list.",
+      "</structured_output_contract>"
+    ].join("\n"),
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "task", "--prompt-file", promptPath], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.threads[0].name, "Codex Companion Task: Fix the flaky login test");
+});
+
+test("task names the thread after the prompt when it has no <task> block", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const promptPath = path.join(repo, "prompt.txt");
+  fs.writeFileSync(promptPath, "check Map<string> typing in the auth module", "utf8");
+
+  const result = run("node", [SCRIPT, "task", "--prompt-file", promptPath], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.threads[0].name, "Codex Companion Task: check Map<string> typing in the auth module");
+});
+
 test("task runs without auth preflight so Codex can refresh an expired session", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -215,6 +326,30 @@ test("task runs without auth preflight so Codex can refresh an expired session",
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Handled the requested task/);
+});
+
+test("task does not split an emoji when shortening the prompt for the thread name and job summary", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  // The thread name keeps the first 53 UTF-16 code units of the prompt and the job summary
+  // the first 93, so put an emoji (a surrogate pair) across each cut.
+  const promptPath = path.join(repo, "prompt.txt");
+  fs.writeFileSync(promptPath, `${"a".repeat(52)}\u{1F534}${"b".repeat(38)}\u{1F534} review the change`, "utf8");
+
+  const result = run("node", [SCRIPT, "task", "--prompt-file", promptPath], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.threads[0].name, `Codex Companion Task: ${"a".repeat(52)}...`);
+  const stateDir = resolveStateDir(repo);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const job = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${state.jobs[0].id}.json`), "utf8"));
+  assert.equal(job.summary, `${"a".repeat(52)}\u{1F534}${"b".repeat(38)}...`);
 });
 
 test("transfer delegates the current Claude session directly to native import", () => {

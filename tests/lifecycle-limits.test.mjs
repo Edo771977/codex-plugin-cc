@@ -6,7 +6,10 @@ import {
   brokerIdleShutdownMs,
   brokerStartupTimeoutMs,
   disarmTimeout,
+  heartbeatStaleAfterMs,
+  jobStallAfterMs,
   turnInterruptBudgetMs,
+  workerHeartbeatIntervalMs,
   workerTtlMs
 } from "../plugins/codex/scripts/lib/lifecycle-limits.mjs";
 import { isPidAlive } from "../plugins/codex/scripts/lib/process.mjs";
@@ -124,4 +127,21 @@ test("durations are clamped to what setTimeout can actually hold", () => {
   const thirtyDays = String(30 * 24 * 60 * 60 * 1000);
   assert.equal(workerTtlMs({ CODEX_TASK_WORKER_TTL_MS: thirtyDays }), MAX_TIMEOUT_MS);
   assert.equal(brokerIdleShutdownMs({ CODEX_BROKER_IDLE_SHUTDOWN_MS: thirtyDays }), MAX_TIMEOUT_MS);
+});
+
+test("the liveness knobs read their own env vars and fall back to their defaults", () => {
+  assert.equal(workerHeartbeatIntervalMs({}), 15 * 1000);
+  assert.equal(heartbeatStaleAfterMs({}), 10 * 60 * 1000);
+  assert.equal(jobStallAfterMs({}), 10 * 60 * 1000);
+
+  assert.equal(workerHeartbeatIntervalMs({ CODEX_COMPANION_HEARTBEAT_INTERVAL_MS: "500" }), 500);
+  assert.equal(heartbeatStaleAfterMs({ CODEX_COMPANION_HEARTBEAT_STALE_MS: "1200" }), 1200);
+  assert.equal(jobStallAfterMs({ CODEX_COMPANION_STALL_AFTER_MS: "90000" }), 90000);
+
+  // `0` means disabled everywhere in this module, and junk falls back rather than disabling.
+  assert.equal(workerHeartbeatIntervalMs({ CODEX_COMPANION_HEARTBEAT_INTERVAL_MS: "0" }), 0);
+  assert.equal(heartbeatStaleAfterMs({ CODEX_COMPANION_HEARTBEAT_STALE_MS: "0" }), 0);
+  assert.equal(jobStallAfterMs({ CODEX_COMPANION_STALL_AFTER_MS: "0" }), 0);
+  assert.equal(jobStallAfterMs({ CODEX_COMPANION_STALL_AFTER_MS: "soon" }), 10 * 60 * 1000);
+  assert.equal(heartbeatStaleAfterMs({ CODEX_COMPANION_HEARTBEAT_STALE_MS: "-5" }), 10 * 60 * 1000);
 });

@@ -4,6 +4,9 @@ const DEFAULT_BROKER_IDLE_SHUTDOWN_MS = 10 * 60 * 1000;
 const DEFAULT_BROKER_STARTUP_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_WORKER_TTL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_TURN_INTERRUPT_BUDGET_MS = 2200;
+const DEFAULT_WORKER_HEARTBEAT_INTERVAL_MS = 15 * 1000;
+const DEFAULT_HEARTBEAT_STALE_AFTER_MS = 10 * 60 * 1000;
+const DEFAULT_JOB_STALL_AFTER_MS = 10 * 60 * 1000;
 
 /** `setTimeout` truncates anything larger to a 32-bit int, firing almost immediately instead. */
 const MAX_TIMEOUT_MS = 2 ** 31 - 1;
@@ -91,4 +94,37 @@ export function turnInterruptBudgetMs(env = process.env) {
  */
 export function workerTtlMs(env = process.env) {
   return readDurationMs(env.CODEX_TASK_WORKER_TTL_MS, DEFAULT_WORKER_TTL_MS);
+}
+
+/**
+ * How often a running worker stamps its job file to say it is still there.
+ *
+ * The pid alone cannot answer that question: an operating system reuses pids, so a record whose
+ * worker died can point at an unrelated live process and read as healthy forever. `0` disables
+ * the heartbeat, which also disables the staleness check below (there is nothing to go stale).
+ */
+export function workerHeartbeatIntervalMs(env = process.env) {
+  return readDurationMs(env.CODEX_COMPANION_HEARTBEAT_INTERVAL_MS, DEFAULT_WORKER_HEARTBEAT_INTERVAL_MS);
+}
+
+/**
+ * How long a heartbeat may go unrefreshed before the job counts as lost.
+ *
+ * Generously larger than the interval: a loaded machine, a suspended laptop or a slow filesystem
+ * can delay a stamp by a lot without the worker being gone, and declaring a live run failed is
+ * the worse mistake of the two. `0` disables the check.
+ */
+export function heartbeatStaleAfterMs(env = process.env) {
+  return readDurationMs(env.CODEX_COMPANION_HEARTBEAT_STALE_MS, DEFAULT_HEARTBEAT_STALE_AFTER_MS);
+}
+
+/**
+ * How long a live run may produce nothing before `/codex:status` flags it as possibly stalled.
+ *
+ * Advisory only: the job keeps running and is never failed on this alone. Codex can legitimately
+ * think for minutes, so this is a hint to the user that a run may be wedged, not a verdict. `0`
+ * disables the flag.
+ */
+export function jobStallAfterMs(env = process.env) {
+  return readDurationMs(env.CODEX_COMPANION_STALL_AFTER_MS, DEFAULT_JOB_STALL_AFTER_MS);
 }

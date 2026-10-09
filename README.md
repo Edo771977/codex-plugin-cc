@@ -379,6 +379,9 @@ Background tasks and reviews run through a shared, workspace-local broker proces
 | `CODEX_BROKER_IDLE_SHUTDOWN_MS` | 10 minutes | How long the shared broker may sit with no connected client before shutting itself down. |
 | `CODEX_BROKER_STARTUP_TIMEOUT_MS` | 5 minutes | How long the broker may spend starting up (spawning its app-server and MCP servers) before it gives up and tears itself down. |
 | `CODEX_TASK_WORKER_TTL_MS` | 24 hours | Ceiling on a detached background task's wall-clock lifetime — a runaway guard, not a task deadline. |
+| `CODEX_COMPANION_HEARTBEAT_INTERVAL_MS` | 15 seconds | How often a running worker stamps its job record to say it is still there. |
+| `CODEX_COMPANION_HEARTBEAT_STALE_MS` | 10 minutes | How long that stamp may go unrefreshed before the job counts as lost. Deliberately far larger than the interval: a loaded machine or a suspended laptop delays a stamp without the worker being gone. |
+| `CODEX_COMPANION_STALL_AFTER_MS` | 10 minutes | How long a live run may produce nothing before `/codex:status` flags it as possibly stalled. Advisory only — the job is never failed on this. |
 
 Set any of these in the environment before starting Claude Code, for example:
 
@@ -455,6 +458,8 @@ Broker and background-job lifecycle:
 | [#773](https://github.com/openai/codex-plugin-cc/pull/773) | a broker connect that never completes is given up on after 2s and falls back to a direct app-server (the probe half of that PR is not taken: ours already bounds each attempt *and* reports why it failed) |
 | [#776](https://github.com/openai/codex-plugin-cc/pull/776) | Windows teardown decides on the root's liveness instead of taskkill's message: a process already gone costs no `taskkill` at all, and a `taskkill` that reports failure only because a short-lived descendant exited mid-walk no longer throws at the caller (its broker-endpoint and shutdown-timeout changes are not taken — one is a no-op here, the other is behind what this fork already does) |
 | [#779](https://github.com/openai/codex-plugin-cc/pull/779) | `--ephemeral` on `task`, so a disposable run does not leave a persistent Codex thread behind (extended here to refuse this fork's `--resume-thread` as well) |
+| [#787](https://github.com/openai/codex-plugin-cc/pull/787) | a graceful teardown reaches a process that is alive but does not lead its own process group: `process.kill(-pid)` reports `ESRCH` for it too, and that was read as "nothing to kill", so such a process only ever met the later force kill |
+| [#800](https://github.com/openai/codex-plugin-cc/pull/800) | shortening a thread name or job summary no longer cuts a surrogate pair in half, which left a lone surrogate in the JSON and made the app-server drop the request |
 
 Commands and flags:
 
@@ -468,9 +473,11 @@ Commands and flags:
 | [#746](https://github.com/openai/codex-plugin-cc/pull/746) | `--model`/`--effort` on the review commands, and a warning for unrecognised options |
 | [#748](https://github.com/openai/codex-plugin-cc/pull/748) | `CLAUDE_ENV_FILE` skips re-exporting an unchanged value (its rewrite-the-file mechanism is not used: the file is shared with other plugins' hooks, so this fork only ever appends to it) |
 | [#731](https://github.com/openai/codex-plugin-cc/pull/731) | the review-gate flag is persisted outside the transient state dir, so a different `CLAUDE_PLUGIN_DATA` no longer silently disables it |
+| [#792](https://github.com/openai/codex-plugin-cc/pull/792) | a delegated thread is named after the `<task>` block of a structured prompt, instead of after the instructions that precede it — every thread shaped by the prompting skill used to read `Codex Companion Task: <task> …` |
 | [#737](https://github.com/openai/codex-plugin-cc/pull/737) | hooks resolve Node through `scripts/run-node.sh`, so nvm/fnm/asdf/mise/Volta/Homebrew toolchains work under the minimal hook PATH |
 | [#747](https://github.com/openai/codex-plugin-cc/pull/747) | `runCommand` sets an explicit 256 MiB `maxBuffer`, so a large `git diff` is no longer truncated at Node's 1 MiB default |
 | [#763](https://github.com/openai/codex-plugin-cc/pull/763) | a turn that fails without throwing stores its error text, so `/codex:result` says why it failed |
+| [#799](https://github.com/openai/codex-plugin-cc/pull/799) | the review commands forbid reading or waiting for the background command's output, instead of naming one tool (`BashOutput`) that was only one way to do it; the result-handling skill's stop rule keeps its substance and loses the shouting |
 
 Where two of these PRs disagreed, the merge commit says which side won and why. The plugin version
 is deliberately left at the upstream number: these merges do not cut a release.
@@ -508,6 +515,26 @@ Beyond the imports, this fork carries fixes for defects the imports themselves s
   duplicate-broker problem upstream; its own two fixes — never tearing down a live broker, and
   serializing the check-then-create window — were already here, and its blanket 3s probe is not
   taken, since it would charge every gone broker for the rare busy one)
+- the broker notices when its *own* app-server dies: it tells every connected client why, closes
+  its endpoint so the next command starts a fresh runtime, and exits — instead of accepting
+  connections in front of a dead backend, where a streaming turn waits forever and every later
+  command hangs (adapted from [#797](https://github.com/openai/codex-plugin-cc/pull/797))
+- a write that can no longer reach the runtime fails its request instead of leaving it pending with
+  nothing left to reject it, and an `EPIPE` on a dead child's stdin no longer takes the whole
+  companion down (adapted from [#797](https://github.com/openai/codex-plugin-cc/pull/797))
+- that broker notice is sent only when the app-server exited *reporting* something. An app-server
+  can exit cleanly right after delivering a final answer, and a run whose answer already arrived
+  completes precisely because the close carried nothing to report — inventing a reason there would
+  fail finished work
+- a worker that is stopped (a Bash timeout, a session ending), crashes, or drains its event loop
+  with the turn unsettled records the failure itself, with the reason, instead of leaving `running`
+  behind for reconciliation to repair later and without an explanation. A cancellation still wins
+  the terminal status (adapted from [#797](https://github.com/openai/codex-plugin-cc/pull/797))
+- a running worker refreshes a heartbeat, so a record whose worker died can no longer read as
+  healthy because the system reused its pid; and a live run that has produced nothing for a while
+  is flagged in `/codex:status` as possibly stalled — never failed on that alone (adapted from
+  [#797](https://github.com/openai/codex-plugin-cc/pull/797); see
+  [Background Runtime Limits](#background-runtime-limits))
 - the app-server typecheck (`npm run build`) passes
 
 Each of those came out of an adversarial review of the merges, re-run after every round of fixes;
@@ -517,7 +544,19 @@ without it.
 Not imported: [#733](https://github.com/openai/codex-plugin-cc/pull/733) (durable startup
 cancellation) — its behavior is already covered here by the terminal-claim mechanism, and its marker
 files would add a second source of truth for the same decision. [#761](https://github.com/openai/codex-plugin-cc/pull/761)
-(`max`/`ultra` reasoning efforts) — the same proposal was closed upstream as [#648](https://github.com/openai/codex-plugin-cc/pull/648).
+(`max`/`ultra` reasoning efforts) — the same proposal was closed upstream as [#648](https://github.com/openai/codex-plugin-cc/pull/648). [#797](https://github.com/openai/codex-plugin-cc/pull/797) (never lose track of jobs whose worker
+died, hung, or lost its runtime) — the goals are shared, the design is not: it runs every command
+through a detached worker that the Claude-side process only attaches to, which replaces this fork's
+terminal claims, worker TTL and record-first cancellation (50 conflicting hunks, most of them
+rewrite against rewrite). Its state locking, atomic writes and reconcile-before-read are already
+here from earlier work. The four mechanisms this fork genuinely lacked were adapted instead, listed
+above; its `--wait-timeout-ms` and "still running" notice are not portable without that execution
+model, because here a foreground command *is* the run — `--background` plus `status --wait` is the
+equivalent today. [#802](https://github.com/openai/codex-plugin-cc/pull/802) (tear down brokers
+leaked by the tests) — this fork already does it, from [#541](https://github.com/openai/codex-plugin-cc/pull/541), and in `tests/helpers.mjs`
+rather than in one test file, so every test that makes a temp directory is covered; ours also only
+tears down sessions carrying our own instance token and reports a teardown that failed instead of
+swallowing it.
 
 ## FAQ
 

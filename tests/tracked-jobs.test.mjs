@@ -3,7 +3,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { claimTerminalStatus, createJobProgressUpdater, reassertTerminalClaim, runTrackedJob, waitForTurnIdentity } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
+import {
+  claimTerminalStatus,
+  createJobProgressUpdater,
+  reassertTerminalClaim,
+  registerWorkerGuards,
+  runTrackedJob,
+  waitForTurnIdentity
+} from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 import { readJobFile, resolveJobClaimFile, resolveJobFile, resolveStateFile, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 
 // A pid that cannot belong to a live process on any supported platform.
@@ -320,4 +327,112 @@ test("progress updates do not touch a job that already reached a terminal status
   const stored = readJobFile(resolveJobFile(workspaceRoot, jobId));
   assert.equal(stored.phase, "cancelled", "a terminal record must not regain a live phase");
   assert.equal(fs.readFileSync(resolveStateFile(workspaceRoot), "utf8"), stateBefore, "state.json must stay untouched");
+});
+
+// The guards are driven through their own seams here rather than by signalling a spawned worker:
+// the pid in a job record is exactly what this fork treats as untrustworthy (it can be stale or
+// reused), so a test that reads one and kills it proves nothing when it passes and lies when it
+// fails. An EventEmitter in place of `process` and an `exitImpl` in place of `process.exit` make
+// the same code paths deterministic.
+import { EventEmitter } from "node:events";
+
+function armedJob(id, options = {}) {
+  const workspaceRoot = makeTempDir();
+  const job = { id, workspaceRoot, title: "Codex Task" };
+  const record = { ...job, status: "running", phase: "editing", pid: 4242 };
+  writeJobFile(workspaceRoot, id, record);
+  upsertJob(workspaceRoot, { ...record, id });
+  const emitter = new EventEmitter();
+  const exits = [];
+  const release = registerWorkerGuards(job, record, {
+    processImpl: emitter,
+    exitImpl: (code) => exits.push(code),
+    // Off unless a test asks for it: the other guard tests must not depend on a timer.
+    heartbeatIntervalMs: options.heartbeatIntervalMs ?? 0
+  });
+  return { workspaceRoot, job, record, emitter, exits, release };
+}
+
+test("a signalled worker records the failure, with the reason and the signal", () => {
+  const { workspaceRoot, job, emitter, exits, release } = armedJob("task-signalled");
+  emitter.emit("SIGTERM");
+  release();
+
+  const stored = readJobFile(resolveJobFile(workspaceRoot, job.id));
+  assert.equal(stored.status, "failed");
+  assert.equal(stored.phase, "failed");
+  assert.equal(stored.pid, null);
+  assert.match(stored.errorMessage, /stopped by SIGTERM before Codex finished/);
+  assert.deepEqual(exits, [143]);
+});
+
+test("a crashing worker records the crash before it goes", () => {
+  const { workspaceRoot, job, emitter, exits, release } = armedJob("task-crashed");
+  emitter.emit("uncaughtException", new Error("boom"));
+  release();
+
+  const stored = readJobFile(resolveJobFile(workspaceRoot, job.id));
+  assert.equal(stored.status, "failed");
+  assert.match(stored.errorMessage, /crashed before Codex finished: boom/);
+  assert.deepEqual(exits, [1]);
+});
+
+test("a drained event loop with the turn unsettled is recorded as a lost connection", () => {
+  const { workspaceRoot, job, emitter, release } = armedJob("task-drained");
+  emitter.emit("beforeExit", 0);
+  release();
+
+  const stored = readJobFile(resolveJobFile(workspaceRoot, job.id));
+  assert.equal(stored.status, "failed");
+  assert.match(stored.errorMessage, /lost its connection to the Codex app-server/);
+  assert.equal(process.exitCode, 1);
+  process.exitCode = 0;
+});
+
+test("the guards never overwrite a cancellation that already owns the terminal status", () => {
+  const { workspaceRoot, job, emitter, release } = armedJob("task-cancelled-then-signalled");
+  // Exactly what a cancel does first: take the claim, then write its record.
+  assert.equal(claimTerminalStatus(workspaceRoot, job.id, "cancel"), true);
+  writeJobFile(workspaceRoot, job.id, { ...readJobFile(resolveJobFile(workspaceRoot, job.id)), status: "cancelled" });
+
+  emitter.emit("SIGTERM");
+  release();
+
+  const stored = readJobFile(resolveJobFile(workspaceRoot, job.id));
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.errorMessage, undefined);
+});
+
+test("a released guard is inert", () => {
+  const { workspaceRoot, job, emitter, exits, release } = armedJob("task-released");
+  release();
+  emitter.emit("SIGTERM");
+
+  const stored = readJobFile(resolveJobFile(workspaceRoot, job.id));
+  assert.equal(stored.status, "running");
+  assert.deepEqual(exits, []);
+});
+
+test("the guards stamp a heartbeat immediately and keep refreshing it", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "Date"] });
+  const { workspaceRoot, job, release } = armedJob("task-heartbeat", { heartbeatIntervalMs: 1000 });
+
+  // Written at arm time, not only on the first tick: a worker killed in its first second still
+  // has to be distinguishable from one that never started.
+  const first = readJobFile(resolveJobFile(workspaceRoot, job.id)).heartbeatAt;
+  assert.ok(first, "no heartbeat was written when the guards were armed");
+
+  t.mock.timers.tick(1000);
+  const second = readJobFile(resolveJobFile(workspaceRoot, job.id)).heartbeatAt;
+  assert.notEqual(second, first);
+
+  release();
+  t.mock.timers.tick(5000);
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).heartbeatAt, second, "a released guard kept stamping");
+});
+
+test("a zero heartbeat interval disables the stamp entirely", () => {
+  const { workspaceRoot, job, release } = armedJob("task-heartbeat-off", { heartbeatIntervalMs: 0 });
+  release();
+  assert.equal(readJobFile(resolveJobFile(workspaceRoot, job.id)).heartbeatAt, undefined);
 });

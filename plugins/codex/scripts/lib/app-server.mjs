@@ -22,6 +22,9 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export { BROKER_BUSY_RPC_CODE } from "./broker-endpoint.mjs";
 
+/** Broker → client: the shared app-server exited, so this connection is about to close. */
+export const BROKER_APP_SERVER_EXITED_METHOD = "broker/appServerExited";
+
 /** How long a failed connect waits for its transport to report an exit before killing it. */
 const CONNECT_CLEANUP_GRACE_MS = 5000;
 
@@ -108,7 +111,15 @@ class AppServerClientBase {
 
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject, method });
-      this.sendMessage({ id, method, params });
+      // The transport can die between the `exitResolved` check above and this write. Without
+      // this catch the request stays in `pending` with nothing left to reject it, and the
+      // caller waits for a reply that can never arrive.
+      try {
+        this.sendMessage({ id, method, params });
+      } catch (error) {
+        this.pending.delete(id);
+        reject(error);
+      }
     });
   }
 
@@ -145,6 +156,17 @@ class AppServerClientBase {
 
     if (message.id !== undefined && message.method) {
       this.handleServerRequest(message);
+      return;
+    }
+
+    if (message.method === BROKER_APP_SERVER_EXITED_METHOD) {
+      // The broker lost its codex app-server and is closing this connection. Keep the reason:
+      // the close that follows rejects every pending request, and "connection closed" alone
+      // would send the user looking for a bug in their own command.
+      this.exitError = createProtocolError(
+        message.params?.message ?? "The shared codex app-server exited.",
+        message.params
+      );
       return;
     }
 
@@ -234,6 +256,11 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     this.proc.stderr.on("data", (chunk) => {
       this.stderr += chunk;
     });
+
+    // Writing to a process that already exited emits EPIPE asynchronously on this stream.
+    // Unhandled, that takes the whole companion down instead of failing the single write;
+    // the exit handler above is what turns it into a result.
+    this.proc.stdin.on("error", () => {});
 
     this.proc.on("error", (error) => {
       this.handleExit(error);
@@ -329,6 +356,11 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     const stdin = this.proc?.stdin;
     if (!stdin) {
       throw new Error("codex app-server stdin is not available.");
+    }
+    // A write onto a finished stream is dropped (or raises asynchronously), so the caller
+    // would wait for a reply to a request the server never received. Fail it here instead.
+    if (this.exitResolved || stdin.destroyed || stdin.writableEnded) {
+      throw this.exitError ?? createProtocolError("codex app-server is no longer running.");
     }
     stdin.write(line);
   }
@@ -442,6 +474,9 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     const socket = this.socket;
     if (!socket) {
       throw new Error("codex app-server broker connection is not connected.");
+    }
+    if (this.exitResolved || socket.destroyed || socket.writableEnded) {
+      throw this.exitError ?? createProtocolError("codex app-server broker connection closed.");
     }
     socket.write(line);
   }

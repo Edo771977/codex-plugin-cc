@@ -3,11 +3,24 @@ import process from "node:process";
 
 import { writePrivateFile } from "./fs.mjs";
 import { isPidAlive } from "./process.mjs";
-import { loadState, readJobFile, resolveJobClaimFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { workerHeartbeatIntervalMs } from "./lifecycle-limits.mjs";
+import {
+  loadState,
+  patchJobFileIfActive,
+  readJobFile,
+  resolveJobClaimFile,
+  resolveJobFile,
+  resolveJobLogFile,
+  upsertJob,
+  writeJobFile
+} from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
 const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+/** Progress events can arrive in bursts; one activity stamp per window is enough. */
+const ACTIVITY_WRITE_THROTTLE_MS = 5000;
 
 export function nowIso() {
   return new Date().toISOString();
@@ -75,6 +88,27 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
   let lastThreadId = null;
   let lastTurnId = null;
+  let lastActivityWriteAt = 0;
+
+  /**
+   * Every progress event proves Codex is still producing output, including the ones that change
+   * nothing else. `/codex:status` reads this to tell a long think apart from a wedged run.
+   * Advisory, throttled, and never allowed to revive a record that has settled.
+   */
+  const touchActivity = () => {
+    const now = Date.now();
+    if (now - lastActivityWriteAt < ACTIVITY_WRITE_THROTTLE_MS) {
+      return;
+    }
+    lastActivityWriteAt = now;
+    try {
+      if (!terminalClaimTaken(workspaceRoot, jobId)) {
+        patchJobFileIfActive(workspaceRoot, jobId, { lastActivityAt: new Date(now).toISOString() });
+      }
+    } catch {
+      // Picked up again by the next event or heartbeat.
+    }
+  };
 
   return (event) => {
     const normalized = normalizeProgressEvent(event);
@@ -98,6 +132,8 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       patch.turnId = normalized.turnId;
       changed = true;
     }
+
+    touchActivity();
 
     if (!changed) {
       return;
@@ -317,6 +353,137 @@ export function claimTerminalStatus(workspaceRoot, jobId, intent = "cancel") {
   }
 }
 
+/**
+ * Make the worker's own death explain itself.
+ *
+ * A job record is only ever written by the process running the job, so a worker that is killed
+ * (a Claude Code Bash timeout, a session ending, an operator), crashes, or drains its event loop
+ * without the turn ever settling leaves the record at "running" with nobody left to correct it.
+ * Reconciliation repairs that on the next read, but only after the fact and only as "its worker
+ * is gone". These handlers record the failure while the process is still alive to say why.
+ *
+ * A cancellation still wins: the terminal claim decides, exactly as in the normal paths.
+ */
+export function registerWorkerGuards(job, record, options = {}) {
+  const { workspaceRoot, id: jobId } = job;
+  const exitImpl = options.exitImpl ?? ((code) => process.exit(code));
+  const emitter = options.processImpl ?? process;
+  let active = true;
+
+  const failIfActive = (message) => {
+    if (!active) {
+      return false;
+    }
+    try {
+      const existing = readStoredJobOrNull(workspaceRoot, jobId) ?? record;
+      if (TERMINAL_JOB_STATUSES.has(existing.status)) {
+        return false;
+      }
+      if (isJobCancelled(workspaceRoot, jobId) || !claimTerminalStatus(workspaceRoot, jobId, "worker")) {
+        reassertTerminalClaim(workspaceRoot, jobId, existing);
+        return false;
+      }
+      active = false;
+      const completedAt = nowIso();
+      writeJobFile(workspaceRoot, jobId, {
+        ...existing,
+        status: "failed",
+        phase: "failed",
+        pid: null,
+        errorMessage: message,
+        completedAt
+      });
+      upsertJob(workspaceRoot, {
+        id: jobId,
+        status: "failed",
+        phase: "failed",
+        pid: null,
+        errorMessage: message,
+        completedAt
+      });
+      return true;
+    } catch {
+      // Bookkeeping must never be what takes the process down; reconciliation remains the
+      // backstop for exactly this case.
+      return false;
+    }
+  };
+
+  // SIGHUP and SIGTERM do not exist as deliverable signals on Windows; SIGBREAK does.
+  const signalNames = process.platform === "win32" ? ["SIGINT", "SIGBREAK"] : ["SIGTERM", "SIGINT", "SIGHUP"];
+  const signalHandlers = new Map();
+  for (const signalName of signalNames) {
+    const handler = () => {
+      failIfActive(
+        `Codex job ${jobId} was stopped by ${signalName} before Codex finished, so no result was recorded.`
+      );
+      exitImpl(128 + (signalName === "SIGINT" ? 2 : signalName === "SIGHUP" ? 1 : 15));
+    };
+    signalHandlers.set(signalName, handler);
+    try {
+      emitter.on(signalName, handler);
+    } catch {
+      // A platform that refuses to listen for one of these keeps the others.
+    }
+  }
+
+  const onBeforeExit = () => {
+    // The event loop drained with the job still active: the connection to Codex went away
+    // without anything rejecting the pending turn. Exiting 0 here would leave a record that
+    // says "running" behind a process that is already gone.
+    if (
+      failIfActive(
+        `Codex job ${jobId} lost its connection to the Codex app-server before the turn completed, so no result was recorded.`
+      )
+    ) {
+      process.exitCode = 1;
+    }
+  };
+  const onCrash = (error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    failIfActive(`Codex job ${jobId} crashed before Codex finished: ${message}`);
+    process.stderr.write(`${message}\n`);
+    exitImpl(1);
+  };
+
+  emitter.on("beforeExit", onBeforeExit);
+  emitter.on("uncaughtException", onCrash);
+  emitter.on("unhandledRejection", onCrash);
+
+  // A pid is not proof of life — the operating system reuses them, so a record left behind by a
+  // dead worker can point at an unrelated live process and read as healthy forever. A stamp the
+  // worker refreshes while it runs is what makes that distinguishable.
+  const heartbeatIntervalMs = options.heartbeatIntervalMs ?? workerHeartbeatIntervalMs();
+  const writeHeartbeat = () => {
+    try {
+      patchJobFileIfActive(workspaceRoot, jobId, { heartbeatAt: nowIso() });
+    } catch {
+      // Heartbeats are advisory: never let one fail the run it is describing.
+    }
+  };
+  let heartbeatTimer = null;
+  if (heartbeatIntervalMs) {
+    writeHeartbeat();
+    heartbeatTimer = setInterval(writeHeartbeat, heartbeatIntervalMs);
+    // Never hold the event loop open on the heartbeat alone.
+    heartbeatTimer.unref?.();
+  }
+
+  return () => {
+    active = false;
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+    for (const [signalName, handler] of signalHandlers) {
+      emitter.off(signalName, handler);
+    }
+    emitter.off("beforeExit", onBeforeExit);
+    emitter.off("uncaughtException", onCrash);
+    emitter.off("unhandledRejection", onCrash);
+  };
+}
+
 export async function runTrackedJob(job, runner, options = {}) {
   // A cancellation may have been recorded before the worker got this far
   // (e.g. cancel raced worker startup); never resurrect a cancelled job. A
@@ -349,6 +516,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     throw new Error(`Job ${job.id} was cancelled before it started.`);
   }
 
+  const releaseWorkerGuards = registerWorkerGuards(job, runningRecord);
   try {
     const execution = await runner();
     // Cancellation is terminal: if it was recorded while the turn was
@@ -424,5 +592,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       completedAt
     });
     throw error;
+  } finally {
+    releaseWorkerGuards();
   }
 }

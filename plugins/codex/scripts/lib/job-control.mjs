@@ -1,6 +1,7 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
+import { heartbeatStaleAfterMs, jobStallAfterMs } from "./lifecycle-limits.mjs";
 import { getConfig, listJobs, readJobFile, resolveJobFileCandidates } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
@@ -28,6 +29,50 @@ function isActiveJob(job) {
   return job.status === "queued" || job.status === "running";
 }
 
+function parseTime(value) {
+  const parsed = Date.parse(value ?? "");
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
+ * Has the worker stopped refreshing its heartbeat?
+ *
+ * Only answerable for a record that carries one: a job started before heartbeats existed, or one
+ * whose worker has not reached its first stamp, is not evidence of anything.
+ */
+function heartbeatWentStale(job, options = {}) {
+  const heartbeatAt = parseTime(job.heartbeatAt);
+  if (heartbeatAt === null) {
+    return false;
+  }
+  const staleAfterMs = heartbeatStaleAfterMs(options.env ?? process.env);
+  if (!staleAfterMs) {
+    return false;
+  }
+  const now = options.now ?? Date.now();
+  return now - heartbeatAt > staleAfterMs;
+}
+
+/**
+ * Flag a live run that has produced nothing for a while. Advisory: the job keeps its status, and
+ * nothing downstream acts on this beyond telling the user where to look.
+ */
+function withStallFlag(job, options = {}) {
+  const stallAfterMs = jobStallAfterMs(options.env ?? process.env);
+  if (!stallAfterMs) {
+    return job;
+  }
+  const lastActivityAt = parseTime(job.lastActivityAt) ?? parseTime(job.startedAt);
+  if (lastActivityAt === null) {
+    return job;
+  }
+  const quietForMs = (options.now ?? Date.now()) - lastActivityAt;
+  if (quietForMs <= stallAfterMs) {
+    return job;
+  }
+  return { ...job, stalled: true, quietForMs };
+}
+
 export function reconcileJobLiveness(job, options = {}) {
   if (!isActiveJob(job)) {
     return job;
@@ -43,25 +88,23 @@ export function reconcileJobLiveness(job, options = {}) {
     return job;
   }
 
+  const lostWorker = () =>
+    job.threadId
+      ? { ...job, status: "running", phase: "worker-exited-turn-unknown", pid: null, workerExited: true }
+      : { ...job, status: "terminated-unknown", phase: "worker-exited" };
+
   const killImpl = options.killImpl ?? process.kill.bind(process);
   try {
     killImpl(job.pid, 0);
-    return job;
+    // The pid answers "something is alive", not "our worker is alive": pids are reused. A
+    // heartbeat that stopped being refreshed is what separates the two.
+    return heartbeatWentStale(job, options) ? lostWorker() : withStallFlag(job, options);
   } catch (error) {
     if (error?.code === "EPERM") {
-      return job;
+      return heartbeatWentStale(job, options) ? lostWorker() : withStallFlag(job, options);
     }
     if (error?.code === "ESRCH") {
-      if (job.threadId) {
-        return {
-          ...job,
-          status: "running",
-          phase: "worker-exited-turn-unknown",
-          pid: null,
-          workerExited: true
-        };
-      }
-      return { ...job, status: "terminated-unknown", phase: "worker-exited" };
+      return lostWorker();
     }
     return job;
   }
@@ -218,7 +261,9 @@ export function enrichJob(job, options = {}) {
     duration:
       job.status === "completed" || job.status === "failed" || job.status === "cancelled"
         ? formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt)
-        : null
+        : null,
+    // Set by reconcileJobLiveness on a live run that has gone quiet; advisory, never a verdict.
+    quietFor: job.stalled ? formatElapsedDuration(job.lastActivityAt ?? job.startedAt) : null
   };
 
   return {
