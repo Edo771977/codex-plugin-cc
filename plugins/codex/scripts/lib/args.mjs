@@ -25,7 +25,11 @@ export function parseArgs(argv, config = {}) {
     }
 
     if (token.startsWith("--")) {
-      const [rawKey, inlineValue] = token.slice(2).split("=", 2);
+      // Split only at the first "=". String.split("=", 2) truncates values
+      // containing further "=" characters (valid in refs and file paths).
+      const separator = token.indexOf("=", 2);
+      const rawKey = separator === -1 ? token.slice(2) : token.slice(2, separator);
+      const inlineValue = separator === -1 ? undefined : token.slice(separator + 1);
       const key = aliasMap[rawKey] ?? rawKey;
 
       if (booleanOptions.has(key)) {
