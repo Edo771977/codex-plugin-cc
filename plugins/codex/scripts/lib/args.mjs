@@ -25,7 +25,11 @@ export function parseArgs(argv, config = {}) {
     }
 
     if (token.startsWith("--")) {
-      const [rawKey, inlineValue] = token.slice(2).split("=", 2);
+      // Split at the first "=" only, so values may contain "=" themselves.
+      const body = token.slice(2);
+      const separator = body.indexOf("=");
+      const rawKey = separator === -1 ? body : body.slice(0, separator);
+      const inlineValue = separator === -1 ? undefined : body.slice(separator + 1);
       const key = aliasMap[rawKey] ?? rawKey;
 
       if (booleanOptions.has(key)) {
@@ -73,56 +77,60 @@ export function parseArgs(argv, config = {}) {
   return { options, positionals };
 }
 
+const QUOTES = new Set(["'", "\""]);
+// Inside the raw string a backslash only escapes these; elsewhere it stays, so text such as a
+// regex (\d+) or a Windows path keeps its backslashes.
+const ESCAPABLE = new Set(["'", "\"", "\\", " ", "\t"]);
+
+/**
+ * Splits a slash command's raw argument string into tokens. Quotes group words only when they
+ * open a token (or follow "=") and have a matching closing quote, so apostrophes in ordinary
+ * text, such as "the user's bug", stay literal instead of swallowing the rest of the line.
+ */
 export function splitRawArgumentString(raw) {
+  const text = String(raw ?? "");
   const tokens = [];
   let current = "";
-  let quote = null;
-  let escaping = false;
+  let started = false;
 
-  for (const character of raw) {
-    if (escaping) {
-      current += character;
-      escaping = false;
+  const finish = () => {
+    if (started) {
+      tokens.push(current);
+    }
+    current = "";
+    started = false;
+  };
+
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+
+    if (character === "\\" && index + 1 < text.length && ESCAPABLE.has(text[index + 1])) {
+      current += text[index + 1];
+      started = true;
+      index += 1;
       continue;
     }
 
-    if (character === "\\") {
-      escaping = true;
-      continue;
-    }
-
-    if (quote) {
-      if (character === quote) {
-        quote = null;
-      } else {
-        current += character;
+    const opensQuote = QUOTES.has(character) && (!started || current.endsWith("="));
+    if (opensQuote) {
+      const closing = text.indexOf(character, index + 1);
+      if (closing !== -1) {
+        current += text.slice(index + 1, closing);
+        started = true;
+        index = closing;
+        continue;
       }
-      continue;
-    }
-
-    if (character === "'" || character === "\"") {
-      quote = character;
-      continue;
     }
 
     if (/\s/.test(character)) {
-      if (current) {
-        tokens.push(current);
-        current = "";
-      }
+      finish();
       continue;
     }
 
     current += character;
+    started = true;
   }
 
-  if (escaping) {
-    current += "\\";
-  }
-
-  if (current) {
-    tokens.push(current);
-  }
-
+  finish();
   return tokens;
 }
