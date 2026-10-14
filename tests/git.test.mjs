@@ -210,3 +210,20 @@ test("collectReviewContext keeps untracked file content in lightweight working t
   assert.match(context.content, /## Untracked Files/);
   assert.match(context.content, /UNTRACKED_RISK_MARKER/);
 });
+
+test("collectReviewContext keeps the first status column and non-ASCII file names", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "a.js"), "one\n");
+  run("git", ["add", "a.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "a.js"), "two\n");
+  fs.writeFileSync(path.join(cwd, "café.js"), "const café = 1;\n");
+
+  const context = collectReviewContext(cwd, { mode: "working-tree", label: "working tree diff" });
+
+  // The index column of the first entry is blank; trimming the section used to drop it.
+  assert.match(context.content, /## Git Status\n\n M a\.js\n\?\? café\.js\n/);
+  assert.ok(context.changedFiles.includes("café.js"), JSON.stringify(context.changedFiles));
+  assert.match(context.content, /const café = 1;/);
+});
