@@ -612,7 +612,15 @@ rl.on("line", (line) => {
 	          prompt
 	        };
 	        saveState(state);
-	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+        if (BEHAVIOR === "missing-turn-id-with-early-event") {
+          // Simulate a notification sent before the turn/start response.
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+        }
+        if (BEHAVIOR === "missing-turn-id" || BEHAVIOR === "missing-turn-id-with-early-event") {
+          send({ id: message.id, result: { turn: { status: "inProgress", items: [] } } });
+        } else {
+          send({ id: message.id, result: { turn: buildTurn(turnId) } });
+        }
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
@@ -782,6 +790,19 @@ rl.on("line", (line) => {
             completed: { type: "agentMessage", id: "msg_" + turnId, text: payload, phase: "final_answer" }
           }
         ];
+
+	        if (BEHAVIOR === "missing-turn-id" || BEHAVIOR === "missing-turn-id-with-early-event") {
+	          // The remaining notifications arrive after turn/start resolves.
+	          setTimeout(() => {
+	            for (const entry of items) {
+	              if (entry.completed) {
+	                send({ method: "item/completed", params: { threadId: thread.id, turnId, item: entry.completed } });
+	              }
+	            }
+	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+	          }, 60);
+	          break;
+	        }
 
 	        if (BEHAVIOR === "crash-mid-turn") {
 	          // The codex app-server dies while a turn is in flight.
