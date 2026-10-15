@@ -81,7 +81,7 @@ function usage() {
     "Options:",
     "  --check       Verify manifest versions. Uses package.json when version is omitted.",
     "  --root <dir>  Run against a different repository root.",
-    "  --help       Print this help."
+    "  -h, --help    Print this help."
   ].join("\n");
 }
 
