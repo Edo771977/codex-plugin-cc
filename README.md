@@ -460,6 +460,7 @@ Broker and background-job lifecycle:
 | [#779](https://github.com/openai/codex-plugin-cc/pull/779) | `--ephemeral` on `task`, so a disposable run does not leave a persistent Codex thread behind (extended here to refuse this fork's `--resume-thread` as well) |
 | [#787](https://github.com/openai/codex-plugin-cc/pull/787) | a graceful teardown reaches a process that is alive but does not lead its own process group: `process.kill(-pid)` reports `ESRCH` for it too, and that was read as "nothing to kill", so such a process only ever met the later force kill |
 | [#800](https://github.com/openai/codex-plugin-cc/pull/800) | shortening a thread name or job summary no longer cuts a surrogate pair in half, which left a lone surrogate in the JSON and made the app-server drop the request |
+| [#809](https://github.com/openai/codex-plugin-cc/pull/809) | a turn whose `turn/start` response carries no turn id still completes: notifications were held until an id turned up, so every later one, `turn/completed` included, sat in the buffer and the run never finished |
 
 Commands and flags:
 
@@ -478,6 +479,8 @@ Commands and flags:
 | [#747](https://github.com/openai/codex-plugin-cc/pull/747) | `runCommand` sets an explicit 256 MiB `maxBuffer`, so a large `git diff` is no longer truncated at Node's 1 MiB default |
 | [#763](https://github.com/openai/codex-plugin-cc/pull/763) | a turn that fails without throwing stores its error text, so `/codex:result` says why it failed |
 | [#799](https://github.com/openai/codex-plugin-cc/pull/799) | the review commands forbid reading or waiting for the background command's output, instead of naming one tool (`BashOutput`) that was only one way to do it; the result-handling skill's stop rule keeps its substance and loses the shouting |
+| [#808](https://github.com/openai/codex-plugin-cc/pull/808) | tests only: inline `--key=value` keeps every `=` after the first. The parser already split there, so only the tests are taken; one is adapted, since this fork rejects a boolean value other than `true`/`false` where upstream reads `--flag=false=extra` as true |
+| [#811](https://github.com/openai/codex-plugin-cc/pull/811) | `scripts/bump-version.mjs --help` lists the `-h` alias it already accepted |
 
 Where two of these PRs disagreed, the merge commit says which side won and why. The plugin version
 is deliberately left at the upstream number: these merges do not cut a release.
