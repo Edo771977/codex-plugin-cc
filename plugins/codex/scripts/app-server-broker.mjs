@@ -20,10 +20,11 @@ import {
 import {
   armTimeout,
   brokerIdleShutdownMs,
+  brokerProcessScanMs,
   brokerStartupTimeoutMs,
   disarmTimeout
 } from "./lib/lifecycle-limits.mjs";
-import { terminateProcessTreeAndExit } from "./lib/process.mjs";
+import { createProcessTreeTracker, terminateProcessTreeAndExit } from "./lib/process.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 const SUBSCRIBING_METHODS = new Set(["thread/start", "thread/resume", "thread/fork"]);
@@ -191,6 +192,14 @@ async function main() {
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
   backendStarted = true;
+  // Closing the app-server does not take its children with it: one that outlives it (an MCP
+  // server, a command it started) is reparented, and one in a process group of its own is out of
+  // reach of a group signal. Remember the tree while it is intact, so shutdown can reap it.
+  const appServerTree = createProcessTreeTracker(appClient.proc?.pid);
+  appServerTree.remember();
+  const processScanMs = brokerProcessScanMs();
+  const processScanTimer = processScanMs ? setInterval(() => appServerTree.remember(), processScanMs) : null;
+  processScanTimer?.unref?.();
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
@@ -560,6 +569,11 @@ async function main() {
 
   async function runShutdown(server, responseSocket) {
     cancelIdleShutdown();
+    // Read the tree one last time while the app-server is still up to lead it.
+    if (processScanTimer) {
+      clearInterval(processScanTimer);
+    }
+    appServerTree.remember();
     // Pending unsubscribe retries are timers on a broker that is going away: left
     // armed they would fire against a closed app-server.
     for (const { timer } of unsubscribeRetryTimers.values()) {
@@ -587,6 +601,12 @@ async function main() {
       backendClosed = true;
     };
     await Promise.race([appClient.close().then(settled, settled), grace()]);
+
+    // Whatever the app-server left behind — its children, or the app-server itself if it never
+    // acknowledged the close — goes now, before the artifacts are cleared, so the client waiting
+    // for this broker's tree to exit sees it gone. Awaited, SIGKILL included: every caller exits
+    // as soon as this returns, so an escalation left on a timer would never fire.
+    const reaped = await appServerTree.reap();
 
     // `end()` only half-closes: a client holding its read side open keeps server.close() pending
     // for as long as it likes, which would hang SIGTERM and broker/shutdown just as surely.
@@ -622,11 +642,12 @@ async function main() {
       // Best effort; a record we cannot read is one we must not delete.
     }
 
-    // If the app-server never acknowledged the close, it is still running — and on POSIX the
-    // client's own fallback signals only its direct pid, so the MCP servers under it would outlive
-    // this broker and defeat the whole point of shutting down. Take the group with us. Done last,
-    // after the artifacts and the record are already cleaned up, because this ends us too.
-    if (!backendClosed) {
+    // If the app-server never acknowledged the close and the tree above could not be read (Windows,
+    // or a process table we cannot see), it is still running — and on POSIX the client's own
+    // fallback signals only its direct pid, so the MCP servers under it would outlive this broker
+    // and defeat the whole point of shutting down. Take the group with us. Done last, after the
+    // artifacts and the record are already cleaned up, because this ends us too.
+    if (!backendClosed && !reaped.known) {
       terminateProcessTreeAndExit(process.pid);
     }
   }
