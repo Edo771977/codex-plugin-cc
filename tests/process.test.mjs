@@ -760,6 +760,25 @@ test("the tracker reaps a child that was reparented after it was remembered", as
   assert.equal(fake.table.has(300), false);
 });
 
+test("the tracker does not forget a process that one reading missed", async () => {
+  const fake = fakeProcessTable([
+    { pid: SELF, parentPid: 1, processGroup: 50, identity: "self" },
+    { pid: APP, parentPid: SELF, processGroup: 50, identity: "app" },
+    { pid: 300, parentPid: APP, processGroup: 300, identity: "mcp" }
+  ]);
+  const tracker = trackerFor(fake);
+  tracker.remember();
+
+  // One reading where its stat file could not be read: the process is absent from that table only.
+  const hidden = fake.table.get(300);
+  fake.table.delete(300);
+  tracker.remember();
+  fake.table.set(300, hidden);
+
+  const outcome = await tracker.reap({ graceMs: 50 });
+  assert.ok(outcome.signalled.includes(300));
+});
+
 test("the tracker never signals a pid that now belongs to a different process", async () => {
   const fake = fakeProcessTable([
     { pid: SELF, parentPid: 1, processGroup: 50, identity: "self" },
@@ -818,8 +837,8 @@ test("the tracker escalates to SIGKILL only for what outlives the grace period",
 test("the tracker kills a child a survivor started during the grace period", async () => {
   const fake = fakeProcessTable(
     [
-      { pid: SELF, parentPid: 1, processGroup: 50, identity: "self" },
-      { pid: APP, parentPid: SELF, processGroup: 50, identity: "app" }
+      { pid: SELF, parentPid: 1, processGroup: 50, session: SELF, identity: "self" },
+      { pid: APP, parentPid: SELF, processGroup: 50, session: SELF, identity: "app" }
     ],
     { ignoresTerm: [APP] }
   );
@@ -828,7 +847,7 @@ test("the tracker kills a child a survivor started during the grace period", asy
     sleepImpl: async () => {
       polls += 1;
       if (polls === 1) {
-        fake.table.set(500, { pid: 500, parentPid: APP, processGroup: 500, identity: "late" });
+        fake.table.set(500, { pid: 500, parentPid: APP, processGroup: 500, session: SELF, identity: "late" });
       }
     }
   });
@@ -873,6 +892,69 @@ test("the tracker reports an unreadable process table instead of claiming a clea
   assert.equal((await throwing.reap()).known, false);
 });
 
+test("the tracker leaves a daemon alone once it has left for a session of its own", async () => {
+  // The app-server runs a build; the build client starts a daemon that detaches into a session of
+  // its own and goes on serving the user's other builds after this broker is gone.
+  const fake = fakeProcessTable([
+    { pid: SELF, parentPid: 1, processGroup: SELF, session: SELF, identity: "self" },
+    { pid: APP, parentPid: SELF, processGroup: SELF, session: SELF, identity: "app" },
+    { pid: 310, parentPid: APP, processGroup: 310, session: SELF, identity: "build-client" },
+    { pid: 311, parentPid: 310, processGroup: 311, session: SELF, identity: "build-worker" },
+    { pid: 320, parentPid: 310, processGroup: 320, session: 320, identity: "daemon" },
+    { pid: 321, parentPid: 320, processGroup: 320, session: 320, identity: "daemon-worker" }
+  ]);
+  const tracker = trackerFor(fake);
+  tracker.remember();
+
+  const outcome = await tracker.reap({ graceMs: 50 });
+  assert.deepEqual(outcome.signalled.sort(), [APP, 310, 311].sort());
+  assert.equal(fake.table.has(320), true, "the daemon serves others now");
+  assert.equal(fake.table.has(321), true, "nothing below the daemon is followed");
+});
+
+test("the tracker still reaps a direct child of the root that detached, but nothing below it", async () => {
+  // An MCP server the app-server started may detach into its own session; it is still ours. What
+  // it started in turn is followed only while it stays in our session.
+  const fake = fakeProcessTable([
+    { pid: SELF, parentPid: 1, processGroup: SELF, session: SELF, identity: "self" },
+    { pid: APP, parentPid: SELF, processGroup: SELF, session: SELF, identity: "app" },
+    { pid: 330, parentPid: APP, processGroup: 330, session: 330, identity: "mcp" },
+    { pid: 331, parentPid: 330, processGroup: 330, session: 330, identity: "mcp-helper" }
+  ]);
+  const tracker = trackerFor(fake);
+  tracker.remember();
+
+  const outcome = await tracker.reap({ graceMs: 50 });
+  assert.deepEqual(outcome.signalled.sort(), [APP, 330].sort());
+  assert.equal(fake.table.has(331), true);
+});
+
+test("without session ids the tracker reaps only the root, its direct children and its group", async () => {
+  // What `ps` reports outside Linux: no session column, so leaving one cannot be told apart from
+  // staying, and the tracker errs towards leaving a process running.
+  const fake = fakeProcessTable([
+    { pid: SELF, parentPid: 1, processGroup: SELF, session: null, identity: "self" },
+    { pid: APP, parentPid: SELF, processGroup: SELF, session: null, identity: "app" },
+    { pid: 340, parentPid: APP, processGroup: 340, session: null, identity: "command" },
+    { pid: 341, parentPid: 340, processGroup: 341, session: null, identity: "maybe-a-daemon" },
+    { pid: 342, parentPid: 340, processGroup: SELF, session: null, identity: "in-our-group" }
+  ]);
+  const tracker = trackerFor(fake);
+  tracker.remember();
+
+  const outcome = await tracker.reap({ graceMs: 50 });
+  assert.deepEqual(outcome.signalled.sort(), [APP, 340, 342].sort());
+  assert.equal(fake.table.has(341), true);
+});
+
+test("the tracker distrusts a reading that does not show the caller", async () => {
+  const fake = fakeProcessTable([{ pid: APP, parentPid: 1, processGroup: SELF, session: SELF, identity: "app" }]);
+  const tracker = trackerFor(fake);
+  tracker.remember();
+  assert.deepEqual(await tracker.reap(), { known: false, signalled: [], killed: [] });
+  assert.deepEqual(fake.signals, []);
+});
+
 test("listProcesses parses ps output, keeps lstart whole, and leaves zombies out", () => {
   const calls = [];
   const entries = listProcesses({
@@ -883,21 +965,26 @@ test("listProcesses parses ps output, keeps lstart whole, and leaves zombies out
         status: 0,
         signal: null,
         error: null,
+        // The ps that produced this reading, listing itself.
+        pid: 104,
         stdout: [
           "  101     1   101 Ss   Thu Oct  2 09:15:01 2026",
           "  102   101   101 S+   Thu Oct  2 09:15:02 2026",
           "  103   101   103 Z    Thu Oct  2 09:15:03 2026",
+          "  104   101   101 R+   Thu Oct  2 09:15:04 2026",
           "garbage"
         ].join("\n")
       };
     }
   });
   assert.equal(calls[0].command, "ps");
+  // One -o per column: other BSDs read a single comma-separated list as one column plus a header.
+  assert.deepEqual(calls[0].args, ["-axww", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "stat=", "-o", "lstart="]);
   assert.equal(calls[0].env.LC_ALL, "C");
   assert.equal(calls[0].env.TZ, "UTC");
   assert.deepEqual(entries, [
-    { pid: 101, parentPid: 1, processGroup: 101, identity: "Thu Oct 2 09:15:01 2026" },
-    { pid: 102, parentPid: 101, processGroup: 101, identity: "Thu Oct 2 09:15:02 2026" }
+    { pid: 101, parentPid: 1, processGroup: 101, session: null, identity: "Thu Oct 2 09:15:01 2026" },
+    { pid: 102, parentPid: 101, processGroup: 101, session: null, identity: "Thu Oct 2 09:15:02 2026" }
   ]);
   assert.equal(listProcesses({ platform: "darwin", runCommandImpl: () => ({ status: 1, stdout: "" }) }), null);
   assert.equal(listProcesses({ platform: "win32" }), null);
@@ -912,6 +999,7 @@ test("listProcesses sees this process with its parent and group", { skip: proces
   assert.ok(Number.isInteger(self.processGroup) && self.processGroup > 0);
   if (process.platform === "linux") {
     assert.equal(self.identity, getProcessIdentity(process.pid));
+    assert.ok(Number.isInteger(self.session) && self.session > 0);
   } else {
     assert.ok(self.identity);
   }

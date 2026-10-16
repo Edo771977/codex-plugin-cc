@@ -9,7 +9,11 @@ import {
   loadBrokerSession,
   shutdownBrokerSession
 } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { isProcessRunning, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import {
+  getProcessIdentity,
+  isProcessRunning,
+  terminateProcessTree
+} from "../plugins/codex/scripts/lib/process.mjs";
 import { makeTempDir, writeExecutable } from "./helpers.mjs";
 
 // A codex stand-in whose app-server starts the kind of children a real one does — an MCP server
@@ -19,6 +23,8 @@ import { makeTempDir, writeExecutable } from "./helpers.mjs";
 //   wedged  ignores both the close and SIGTERM
 //   late    like clean, but starts one more child after the handshake, in a group of its own
 //   crash   starts that same late child, then dies
+//   daemon  like clean, plus a build client that starts a daemon in a session of its own
+// Every child gives up on its own after two minutes, so a failing test cannot strand it for good.
 function installTreeCodex(binDir, mode) {
   const pidsFile = path.join(binDir, "pids.json");
   writeExecutable(
@@ -29,7 +35,8 @@ const fs = require("node:fs");
 const readline = require("node:readline");
 const MODE = ${JSON.stringify(mode)};
 const PIDS = ${JSON.stringify(pidsFile)};
-const idle = ["-e", "setInterval(() => {}, 1000)"];
+const LIFETIME = "setTimeout(() => process.exit(0), 120000);";
+const idle = ["-e", "setInterval(() => {}, 1000); " + LIFETIME];
 const pids = { app: process.pid };
 function record() {
   fs.writeFileSync(PIDS + ".tmp", JSON.stringify(pids));
@@ -37,8 +44,20 @@ function record() {
 }
 pids.sameGroup = spawn(process.execPath, idle, { stdio: "ignore" }).pid;
 pids.ownGroup = spawn(process.execPath, idle, { stdio: "ignore", detached: true }).pid;
-pids.stubborn = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" }).pid;
+pids.stubborn = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000); " + LIFETIME], { stdio: "ignore" }).pid;
 record();
+if (MODE === "daemon") {
+  const client = spawn(
+    process.execPath,
+    ["-e", "const d = require('node:child_process').spawn(process.execPath, " + JSON.stringify(idle) + ", { stdio: 'ignore', detached: true }); process.stdout.write(String(d.pid)); setInterval(() => {}, 1000); " + LIFETIME],
+    { stdio: ["ignore", "pipe", "ignore"] }
+  );
+  pids.client = client.pid;
+  client.stdout.once("data", (chunk) => {
+    pids.daemon = Number(String(chunk));
+    record();
+  });
+}
 if (MODE === "wedged") process.on("SIGTERM", () => {});
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
@@ -74,7 +93,11 @@ async function waitFor(predicate, { timeoutMs = 15000, intervalMs = 50 } = {}) {
 }
 
 function readPids(pidsFile) {
-  return JSON.parse(fs.readFileSync(pidsFile, "utf8"));
+  try {
+    return JSON.parse(fs.readFileSync(pidsFile, "utf8"));
+  } catch {
+    return {};
+  }
 }
 
 // Zombie-aware: a killed child stays in the table until init reaps it, and that is not a leak.
@@ -94,20 +117,40 @@ async function startTreeBroker(t, mode, extraEnv = {}) {
     PATH: `${binDir}:${process.env.PATH}`,
     ...extraEnv
   };
-  const session = await ensureBrokerSession(workspace, { env });
-  assert.ok(session?.pid, "the broker must start");
-  assert.ok(await waitFor(() => fs.existsSync(pidsFile)), "the fake app-server must record its children");
+  // Registered before anything can fail, and lazy: whatever the assertions found, leave nothing
+  // behind for the rest of the suite. Each pid is pinned to the process it named when the test saw
+  // it, so a pid reused since is never killed.
+  const seen = new Map();
+  const pin = (pid) => {
+    if (Number.isInteger(pid) && !seen.has(pid)) {
+      seen.set(pid, getProcessIdentity(pid));
+    }
+  };
+  let brokerPid = null;
   t.after(() => {
-    // Whatever the assertions found, leave nothing behind for the rest of the suite.
-    for (const pid of [session.pid, ...Object.values(readPids(pidsFile))]) {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        // Already gone.
+    pin(brokerPid);
+    for (const pid of Object.values(readPids(pidsFile))) {
+      pin(pid);
+    }
+    for (const [pid, identity] of seen) {
+      if (identity && isProcessRunning(pid, { identity })) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
       }
     }
   });
-  return { workspace, session, pidsFile };
+  const session = await ensureBrokerSession(workspace, { env });
+  brokerPid = session?.pid ?? null;
+  pin(brokerPid);
+  assert.ok(session?.pid, "the broker must start");
+  assert.ok(await waitFor(() => fs.existsSync(pidsFile)), "the fake app-server must record its children");
+  for (const pid of Object.values(readPids(pidsFile))) {
+    pin(pid);
+  }
+  return { workspace, session, pidsFile, pin };
 }
 
 test(
@@ -125,6 +168,25 @@ test(
     assert.equal(loadBrokerSession(workspace), null);
 
     assert.ok(await waitFor(() => survivors(pids).length === 0), `still running: ${survivors(pids).join(", ")}`);
+  }
+);
+
+test(
+  "a daemon a command started in a session of its own outlives the broker",
+  { skip: process.platform !== "linux" },
+  async (t) => {
+    // A Gradle daemon, an ssh ControlPersist master, another workspace's broker: each passes
+    // through the app-server's tree on its way to a session of its own, then serves others.
+    const { workspace, pidsFile, pin } = await startTreeBroker(t, "daemon");
+    assert.ok(await waitFor(() => readPids(pidsFile).daemon), "the build client must start its daemon");
+    const { daemon, ...ours } = readPids(pidsFile);
+    pin(daemon);
+    // The reading shutdown takes still finds the daemon below its client; it is left alone anyway.
+    const outcome = await shutdownBrokerSession(workspace, { killProcess: terminateProcessTree });
+    assert.equal(outcome.exited, true);
+
+    assert.ok(await waitFor(() => survivors(ours).length === 0), `still running: ${survivors(ours).join(", ")}`);
+    assert.equal(isProcessRunning(daemon), true, "the daemon is not the broker's to stop");
   }
 );
 
