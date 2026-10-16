@@ -27,6 +27,9 @@
 - Fail a request whose write can no longer reach the runtime, rather than leaving it pending with nothing left to reject it, and stop an `EPIPE` on a dead child's stdin from taking the companion down with it (adapted from openai/codex-plugin-cc#797).
 - Record the failure from inside the worker when it is stopped by a signal, crashes, or drains its event loop with the turn unsettled — with the reason, and without overriding a cancellation that owns the terminal status (adapted from openai/codex-plugin-cc#797).
 - Refresh a heartbeat on a running job's record, so a worker that died cannot read as alive because its pid was reused, and flag a live run that has gone quiet as possibly stalled in `/codex:status` without ever failing it on that alone. Tunable through `CODEX_COMPANION_HEARTBEAT_INTERVAL_MS`, `CODEX_COMPANION_HEARTBEAT_STALE_MS` and `CODEX_COMPANION_STALL_AFTER_MS` (adapted from openai/codex-plugin-cc#797).
+- Complete a turn whose `turn/start` response carries no turn id: notifications are buffered only until that request settles, not until an id appears, so `turn/completed` is no longer held forever (openai/codex-plugin-cc#809).
+- Pin inline `--key=value` parsing with tests: every `=` after the first stays in the value. The parser already behaved this way; only the tests are imported (openai/codex-plugin-cc#808).
+- List the `-h` alias in `scripts/bump-version.mjs --help` (openai/codex-plugin-cc#811).
 
 ## 1.0.0
 
