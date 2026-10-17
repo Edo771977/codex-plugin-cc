@@ -466,6 +466,7 @@ Broker and background-job lifecycle:
 | [#787](https://github.com/openai/codex-plugin-cc/pull/787) | a graceful teardown reaches a process that is alive but does not lead its own process group: `process.kill(-pid)` reports `ESRCH` for it too, and that was read as "nothing to kill", so such a process only ever met the later force kill |
 | [#800](https://github.com/openai/codex-plugin-cc/pull/800) | shortening a thread name or job summary no longer cuts a surrogate pair in half, which left a lone surrogate in the JSON and made the app-server drop the request |
 | [#809](https://github.com/openai/codex-plugin-cc/pull/809) | a turn whose `turn/start` response carries no turn id still completes: notifications were held until an id turned up, so every later one, `turn/completed` included, sat in the buffer and the run never finished |
+| [#817](https://github.com/openai/codex-plugin-cc/pull/817) | the review context keeps the first column of `git status --short` (an unstaged change lost its leading space) and non-ASCII file names: with git's default `core.quotePath`, an untracked `café.js` was listed under a quoted name that does not exist on disk and left out of the review |
 
 Commands and flags:
 
@@ -486,6 +487,7 @@ Commands and flags:
 | [#799](https://github.com/openai/codex-plugin-cc/pull/799) | the review commands forbid reading or waiting for the background command's output, instead of naming one tool (`BashOutput`) that was only one way to do it; the result-handling skill's stop rule keeps its substance and loses the shouting |
 | [#808](https://github.com/openai/codex-plugin-cc/pull/808) | tests only: inline `--key=value` keeps every `=` after the first. The parser already split there, so only the tests are taken; one is adapted, since this fork rejects a boolean value other than `true`/`false` where upstream reads `--flag=false=extra` as true |
 | [#811](https://github.com/openai/codex-plugin-cc/pull/811) | `scripts/bump-version.mjs --help` lists the `-h` alias it already accepted |
+| [#816](https://github.com/openai/codex-plugin-cc/pull/816) | a slash command's raw arguments keep apostrophes and backslashes: `fix the user's bug --background` no longer swallows `--background` into the prompt, and `C:\Users\x` or `\d+` keep their backslashes (its `--key=value` half was already here) |
 
 Where two of these PRs disagreed, the merge commit says which side won and why. The plugin version
 is deliberately left at the upstream number: these merges do not cut a release.
