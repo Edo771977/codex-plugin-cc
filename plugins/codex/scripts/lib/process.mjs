@@ -32,6 +32,7 @@ export function runCommand(command, args = [], options = {}) {
     // null status and a non-null signal.
     status: result.status,
     signal: result.signal ?? null,
+    pid: result.pid ?? null,
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
     error: result.error ?? null
@@ -139,7 +140,9 @@ function readLinuxProcessStat(pid) {
     const fields = stat.slice(commandEnd + 1).trim().split(/\s+/);
     return {
       state: fields[0] ?? null,
+      parentPid: fields[1] ?? null,
       processGroup: fields[2] ?? null,
+      session: fields[3] ?? null,
       // /proc/<pid>/stat field 22; fields starts at field 3.
       startTime: fields[19] ?? null
     };
@@ -591,6 +594,304 @@ export function terminateProcessTree(pid, options = {}) {
       throw error;
     }
   }
+}
+
+/**
+ * Every live process on a POSIX system, as `{ pid, parentPid, processGroup, session, identity }`.
+ *
+ * `identity` is the process's start time, so an entry compares equal only to the same process: a
+ * pid the system handed to someone else since reads as a different entry. It is `null` when the
+ * start time cannot be read, and such an entry is never trusted as a match. `session` is the
+ * session id, read on Linux only and `null` elsewhere. Zombies are left out — they own nothing and
+ * cannot be signalled into exiting — and so is the `ps` this reading ran, which is gone by the time
+ * anyone looks at the result.
+ *
+ * Returns `null` on Windows, which has no process groups and does not reparent orphans, and when
+ * the table itself cannot be read; callers treat that as "nothing is known", never as "nothing is
+ * running".
+ */
+export function listProcesses(options = {}) {
+  const platform = options.platform ?? process.platform;
+  if (platform === "win32") {
+    return null;
+  }
+  if (platform === "linux" && !options.runCommandImpl) {
+    let names;
+    try {
+      names = fs.readdirSync("/proc");
+    } catch {
+      return null;
+    }
+    const boot = bootId();
+    const readProcessStat = options.readProcessStat ?? readLinuxProcessStat;
+    const entries = [];
+    for (const name of names) {
+      if (!/^\d+$/.test(name)) {
+        continue;
+      }
+      const stat = readProcessStat(Number(name));
+      if (!stat || stat.state === "Z" || stat.state === "X") {
+        continue;
+      }
+      entries.push({
+        pid: Number(name),
+        parentPid: Number(stat.parentPid),
+        processGroup: Number(stat.processGroup),
+        session: stat.session != null ? Number(stat.session) : null,
+        // Same composite as getProcessIdentity(): a bare tick count is boot-relative.
+        identity: boot && stat.startTime != null ? `${boot}:${stat.startTime}` : null
+      });
+    }
+    return entries;
+  }
+
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  // Fixed locale and zone for the same reason as queryProcessTable(): lstart is rendered through
+  // the C library, and two readings of one process must print the same.
+  // One -o per column: the BSDs other than macOS read everything after the first "=" of a single
+  // comma-separated list as that column's header, which leaves every line unparseable.
+  const result = runCommandImpl("ps", ["-axww", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "stat=", "-o", "lstart="], {
+    timeout: options.timeoutMs ?? 2000,
+    killSignal: "SIGTERM",
+    env: { ...(options.env ?? process.env), LC_ALL: "C", TZ: "UTC" }
+  });
+  if (result.error || result.signal != null || result.status !== 0) {
+    return null;
+  }
+  const entries = [];
+  for (const line of String(result.stdout ?? "").split("\n")) {
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.+?)\s*$/);
+    if (!match || match[4].startsWith("Z") || Number(match[1]) === result.pid) {
+      continue;
+    }
+    entries.push({
+      pid: Number(match[1]),
+      parentPid: Number(match[2]),
+      processGroup: Number(match[3]),
+      session: null,
+      identity: match[5].replace(/\s+/g, " ")
+    });
+  }
+  return entries;
+}
+
+/** The entries of `table` below `rootPid`, following parent links; the root itself is excluded. */
+export function descendantsOf(rootPid, table) {
+  const children = new Map();
+  for (const entry of table) {
+    if (entry.pid === entry.parentPid) {
+      continue;
+    }
+    const siblings = children.get(entry.parentPid) ?? [];
+    siblings.push(entry);
+    children.set(entry.parentPid, siblings);
+  }
+  const found = [];
+  const seen = new Set([rootPid]);
+  const queue = [rootPid];
+  while (queue.length > 0) {
+    for (const child of children.get(queue.shift()) ?? []) {
+      if (!seen.has(child.pid)) {
+        seen.add(child.pid);
+        found.push(child);
+        queue.push(child.pid);
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * Keep track of a process tree that outlives its root, and take it down on request.
+ *
+ * Signalling a root — or even its process group — does not reach everything it started: a child
+ * of an app-server that exits on its own is reparented, and parent links no longer lead to it; a
+ * child that moved to its own process group (or session) is out of reach of a group signal. Both
+ * keep running after their owner is gone, with nothing left that knows about them. So the tree is
+ * remembered while it is still intact — each `remember()` adds whatever is below the root right
+ * now — and `reap()` signals what is left of it.
+ *
+ * Every remembered entry carries its start time and is signalled only while a fresh reading still
+ * shows the same process under that pid; a pid the system has since reused is left alone. The
+ * process group named after the caller is reaped as well — only the caller can have created it.
+ *
+ * Not everything that was once below the root is the root's to take down. A daemon a command
+ * started — a Gradle daemon, an ssh ControlPersist master, another workspace's broker launched by a
+ * `claude -p` inside a turn — passes through the tree on its way to a session of its own, and from
+ * then on it serves others. So an entry that has left the caller's session is reaped only when it
+ * was a direct child of the root (an MCP server the app-server started, which may well detach), and
+ * nothing below such an entry is ever followed. Where sessions cannot be read (anywhere but Linux),
+ * every entry is treated as having left: only the root, its direct children and the caller's group
+ * are reaped, which errs towards leaving something running.
+ *
+ * Best effort and never throws. On Windows (and wherever the process table cannot be read) it
+ * knows nothing and reaps nothing; the caller's existing teardown is all there is.
+ */
+export function createProcessTreeTracker(rootPid, options = {}) {
+  const selfPid = options.selfPid ?? process.pid;
+  const list = () => {
+    let table;
+    try {
+      table = (options.listProcessesImpl ?? listProcesses)(options);
+    } catch {
+      return null;
+    }
+    // A reading that does not even show the caller is not a reading of this system's processes;
+    // trusting it would report "nothing left" for a tree nobody looked at.
+    return Array.isArray(table) && table.some((entry) => entry.pid === selfPid) ? table : null;
+  };
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+  const sleep = options.sleepImpl ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  /** @type {Map<string, { pid: number, identity: string, direct: boolean, misses: number }>} */
+  const owned = new Map();
+  const keyOf = (entry) => `${entry.pid}:${entry.identity}`;
+
+  function rememberEntry(entry, direct) {
+    if (entry.pid === selfPid || !entry.identity) {
+      return;
+    }
+    const key = keyOf(entry);
+    // Once a direct child, always one: a reparented child no longer points at the root.
+    owned.set(key, {
+      pid: entry.pid,
+      identity: entry.identity,
+      direct: direct || Boolean(owned.get(key)?.direct),
+      misses: 0
+    });
+  }
+
+  /** Whether `entry` is still in the caller's session; never true where sessions are unreadable. */
+  function inOwnSession(entry, table) {
+    const self = table.find((candidate) => candidate.pid === selfPid);
+    return self?.session != null && entry.session === self.session;
+  }
+
+  /** What, in `table`, is still ours: remembered entries, their new descendants, and our group. */
+  function survivors(table) {
+    const byPid = new Map(table.map((entry) => [entry.pid, entry]));
+    const found = new Map();
+    const add = (entry) => {
+      if (entry.pid !== selfPid && entry.pid > 1) {
+        found.set(entry.pid, entry);
+      }
+    };
+    for (const { pid, identity, direct } of owned.values()) {
+      const current = byPid.get(pid);
+      if (current && current.identity === identity && (direct || inOwnSession(current, table))) {
+        add(current);
+      }
+    }
+    // A process group is named after the process that created it, and a pid is unique while its
+    // process lives: a group carrying our pid can only be one we started.
+    for (const entry of table) {
+      if (entry.processGroup === selfPid) {
+        add(entry);
+      }
+    }
+    // Something a survivor started after the last reading belongs to us just the same — as long as
+    // it is still in our session. That also stops the walk below anything that left: a session can
+    // only be left for a new one, so nothing below a process that left can be in ours.
+    for (const entry of [...found.values()]) {
+      for (const child of descendantsOf(entry.pid, table)) {
+        if (inOwnSession(child, table)) {
+          add(child);
+        }
+      }
+    }
+    return [...found.values()];
+  }
+
+  return {
+    /**
+     * Add whatever is below the root right now, and forget entries that are gone. An entry is
+     * forgotten only after two readings in a row miss it: a single unreadable stat file is not
+     * proof of exit, and forgetting is final.
+     */
+    remember() {
+      const table = list();
+      if (!table) {
+        return;
+      }
+      const present = new Set(table.map(keyOf));
+      for (const [key, entry] of owned) {
+        if (present.has(key)) {
+          entry.misses = 0;
+        } else if (++entry.misses >= 2) {
+          owned.delete(key);
+        }
+      }
+      const root = table.find((entry) => entry.pid === rootPid);
+      if (root) {
+        rememberEntry(root, true);
+        for (const entry of descendantsOf(rootPid, table)) {
+          rememberEntry(entry, entry.parentPid === rootPid);
+        }
+      }
+    },
+
+    /**
+     * SIGTERM what is left, give it `graceMs` to leave, then SIGKILL whatever still answers to the
+     * same identity. Resolves with the pids that were signalled and killed; `known` is false when
+     * the process table could not be read, so nothing was.
+     */
+    async reap({ graceMs = 1000, intervalMs = 25 } = {}) {
+      const table = list();
+      if (!table) {
+        return { known: false, signalled: [], killed: [] };
+      }
+      const targets = survivors(table);
+      for (const entry of targets) {
+        try {
+          killImpl(entry.pid, "SIGTERM");
+        } catch {
+          // Gone already, or not ours to signal; either way there is nothing more to do for it.
+        }
+      }
+      if (targets.length === 0) {
+        return { known: true, signalled: [], killed: [] };
+      }
+      const deadline = Date.now() + graceMs;
+      let remaining = targets;
+      while (remaining.length > 0 && Date.now() < deadline) {
+        await sleep(intervalMs);
+        const current = list();
+        if (!current) {
+          break;
+        }
+        const live = new Set(survivors(current).map(keyOf));
+        remaining = remaining.filter((entry) => live.has(keyOf(entry)));
+      }
+      const killed = [];
+      const current = list();
+      if (current) {
+        const live = new Map(survivors(current).map((entry) => [keyOf(entry), entry]));
+        for (const entry of remaining) {
+          const still = live.get(keyOf(entry));
+          if (!still) {
+            continue;
+          }
+          try {
+            killImpl(still.pid, "SIGKILL");
+            killed.push(still.pid);
+          } catch {
+            // Exited between the reading and the kill.
+          }
+        }
+        // A survivor may have started children during the grace period; they get no grace.
+        for (const entry of live.values()) {
+          if (!targets.some((target) => keyOf(target) === keyOf(entry))) {
+            try {
+              killImpl(entry.pid, "SIGKILL");
+              killed.push(entry.pid);
+            } catch {
+              // Exited already.
+            }
+          }
+        }
+      }
+      return { known: true, signalled: targets.map((entry) => entry.pid), killed };
+    }
+  };
 }
 
 export function formatCommandFailure(result) {

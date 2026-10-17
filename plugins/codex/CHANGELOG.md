@@ -30,6 +30,8 @@
 - Complete a turn whose `turn/start` response carries no turn id: notifications are buffered only until that request settles, not until an id appears, so `turn/completed` is no longer held forever (openai/codex-plugin-cc#809).
 - Pin inline `--key=value` parsing with tests: every `=` after the first stays in the value. The parser already behaved this way; only the tests are imported (openai/codex-plugin-cc#808).
 - List the `-h` alias in `scripts/bump-version.mjs --help` (openai/codex-plugin-cc#811).
+- Take the app-server's process tree down when the broker shuts down: its MCP servers and anything a turn left running, including children in a process group of their own and children already reparented. Remembered processes are matched by pid and start time, and what outlasts a one-second grace after SIGTERM gets SIGKILL. A daemon a command started in a session of its own (a Gradle daemon, an ssh master, another workspace's broker) is left running; outside Linux, where sessions cannot be read, only the app-server, its direct children and the broker's process group are reaped. The session-end hook no longer fails with "ownership changed before forced shutdown" because leftover children kept the broker's process group alive. The tree is re-read every `CODEX_BROKER_PROCESS_SCAN_MS` (10 seconds by default) (adapted from openai/codex-plugin-cc#814).
+- Kill an app-server that ignores both the close and SIGTERM: the SIGKILL meant for it sat on a timer that the broker's own exit always cancelled. On the idle and app-server-exit paths that is the whole fix; the session-end hook still reports such a broker as not exited, because it stops waiting before the broker's five-second close grace ends, but the tree is gone shortly after.
 
 ## 1.0.0
 

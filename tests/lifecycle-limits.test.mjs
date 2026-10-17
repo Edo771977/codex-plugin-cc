@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   armTimeout,
   brokerIdleShutdownMs,
+  brokerProcessScanMs,
   brokerStartupTimeoutMs,
   disarmTimeout,
   heartbeatStaleAfterMs,
@@ -144,4 +145,11 @@ test("the liveness knobs read their own env vars and fall back to their defaults
   assert.equal(jobStallAfterMs({ CODEX_COMPANION_STALL_AFTER_MS: "0" }), 0);
   assert.equal(jobStallAfterMs({ CODEX_COMPANION_STALL_AFTER_MS: "soon" }), 10 * 60 * 1000);
   assert.equal(heartbeatStaleAfterMs({ CODEX_COMPANION_HEARTBEAT_STALE_MS: "-5" }), 10 * 60 * 1000);
+});
+
+test("broker process scan defaults to ten seconds, honours an override and can be disabled", () => {
+  assert.equal(brokerProcessScanMs({}), 10 * 1000);
+  assert.equal(brokerProcessScanMs({ CODEX_BROKER_PROCESS_SCAN_MS: "250" }), 250);
+  assert.equal(brokerProcessScanMs({ CODEX_BROKER_PROCESS_SCAN_MS: "0" }), 0);
+  assert.equal(brokerProcessScanMs({ CODEX_BROKER_PROCESS_SCAN_MS: "soon" }), 10 * 1000);
 });

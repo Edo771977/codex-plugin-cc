@@ -7,6 +7,7 @@ const DEFAULT_TURN_INTERRUPT_BUDGET_MS = 2200;
 const DEFAULT_WORKER_HEARTBEAT_INTERVAL_MS = 15 * 1000;
 const DEFAULT_HEARTBEAT_STALE_AFTER_MS = 10 * 60 * 1000;
 const DEFAULT_JOB_STALL_AFTER_MS = 10 * 60 * 1000;
+const DEFAULT_BROKER_PROCESS_SCAN_MS = 10 * 1000;
 
 /** `setTimeout` truncates anything larger to a 32-bit int, firing almost immediately instead. */
 const MAX_TIMEOUT_MS = 2 ** 31 - 1;
@@ -57,6 +58,20 @@ export function disarmTimeout(timer) {
  */
 export function brokerIdleShutdownMs(env = process.env) {
   return readDurationMs(env.CODEX_BROKER_IDLE_SHUTDOWN_MS, DEFAULT_BROKER_IDLE_SHUTDOWN_MS);
+}
+
+/**
+ * How often the broker re-reads its app-server's process tree.
+ *
+ * A child of the app-server is reparented as soon as its parent exits, and from then on nothing
+ * leads back to it but what the broker remembered beforehand; each reading adds whatever is below
+ * the app-server right now, so its shutdown can take those down too. The tree is also read at
+ * startup and when shutdown begins, so this only matters for children that would otherwise be
+ * orphaned before shutdown — an app-server that crashes, or a child that outlives its own parent.
+ * `0` disables the periodic reading and keeps the other two.
+ */
+export function brokerProcessScanMs(env = process.env) {
+  return readDurationMs(env.CODEX_BROKER_PROCESS_SCAN_MS, DEFAULT_BROKER_PROCESS_SCAN_MS);
 }
 
 /**

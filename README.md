@@ -377,6 +377,7 @@ Background tasks and reviews run through a shared, workspace-local broker proces
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CODEX_BROKER_IDLE_SHUTDOWN_MS` | 10 minutes | How long the shared broker may sit with no connected client before shutting itself down. |
+| `CODEX_BROKER_PROCESS_SCAN_MS` | 10 seconds | How often the broker re-reads its app-server's process tree, so that shutdown can still reach a child whose parent has already exited. `0` keeps only the readings at startup and at shutdown. |
 | `CODEX_BROKER_STARTUP_TIMEOUT_MS` | 5 minutes | How long the broker may spend starting up (spawning its app-server and MCP servers) before it gives up and tears itself down. |
 | `CODEX_TASK_WORKER_TTL_MS` | 24 hours | Ceiling on a detached background task's wall-clock lifetime — a runaway guard, not a task deadline. |
 | `CODEX_COMPANION_HEARTBEAT_INTERVAL_MS` | 15 seconds | How often a running worker stamps its job record to say it is still there. |
@@ -390,6 +391,10 @@ export CODEX_BROKER_IDLE_SHUTDOWN_MS=1800000  # 30 minutes
 ```
 
 `CODEX_BROKER_IDLE_SHUTDOWN_MS` does double duty: it also bounds how long a job whose worker died with a turn still possibly running keeps the runtime up (the `worker-exited-turn-unknown` state above). Session end leaves the broker alive for such a job instead of killing the turn under it; once that window passes, the next session end reclaims both. With the timer disabled (`0`), the fallback is 24 hours rather than forever.
+
+When the broker shuts down — at session end, on its idle timer, or because its app-server died — it takes the app-server's process tree with it: its MCP servers, and anything a Codex turn started that is still running, a dev server left in the background included. What ignores SIGTERM for a second gets SIGKILL. A process remembered from an earlier reading is signalled only while the same pid still shows the same start time, so a pid the system has since given to something else is never touched; members of the broker's own process group need no such check, since only the broker can have created that group.
+
+A daemon that a command started and that detached into a session of its own — a Gradle daemon, an ssh ControlPersist master, another workspace's broker started by a nested `claude -p` — is left running: it serves others from then on. Only a *direct* child of the app-server is reaped after detaching like that, since that is how an MCP server it started looks. Session ids are read on Linux only; elsewhere every process is treated as possibly detached, so only the app-server, its direct children and the broker's group are reaped. On Windows the existing `taskkill /T` teardown is all there is: there are no process groups to read, and children are not reparented.
 
 These are advanced knobs for tuning resource usage in long-running or resource-constrained environments; most users will never need to touch them.
 
@@ -538,6 +543,19 @@ Beyond the imports, this fork carries fixes for defects the imports themselves s
   is flagged in `/codex:status` as possibly stalled — never failed on that alone (adapted from
   [#797](https://github.com/openai/codex-plugin-cc/pull/797); see
   [Background Runtime Limits](#background-runtime-limits))
+- the broker takes its app-server's process tree down when it shuts down. Before, a child of the
+  app-server — an MCP server, a command left running — survived every shutdown: closing the
+  app-server does not stop its children, one in a process group of its own is out of reach of a
+  group signal, and one whose parent already exited is reparented where nothing leads to it. The
+  survivors also kept the dead broker's process group alive, so the session-end hook failed with
+  "ownership changed before forced shutdown". The tree is remembered by pid and start time while it
+  is intact, and reaped with a SIGKILL for what outlasts a one-second grace (adapted from
+  [#814](https://github.com/openai/codex-plugin-cc/pull/814))
+- an app-server that ignores both the close and SIGTERM no longer outlives its broker: the SIGKILL
+  meant for it waited on a timer, and every caller of the broker's shutdown exits as soon as it
+  returns, so that timer never fired. The session-end hook still reports such a broker as not
+  exited — it stops waiting before the broker's five-second close grace runs out — but the tree is
+  gone a second after that
 - the app-server typecheck (`npm run build`) passes
 
 Each of those came out of an adversarial review of the merges, re-run after every round of fixes;
@@ -559,7 +577,10 @@ equivalent today. [#802](https://github.com/openai/codex-plugin-cc/pull/802) (te
 leaked by the tests) — this fork already does it, from [#541](https://github.com/openai/codex-plugin-cc/pull/541), and in `tests/helpers.mjs`
 rather than in one test file, so every test that makes a temp directory is covered; ours also only
 tears down sessions carrying our own instance token and reports a teardown that failed instead of
-swallowing it.
+swallowing it. [#814](https://github.com/openai/codex-plugin-cc/pull/814) (clean up idle app-server
+process trees) — its process-tree cleanup is adapted above; its own idle timer is not taken, since
+this fork's broker already shuts itself down when idle and that timer would be a second one, with
+its own notion of idle read from the job index.
 
 ## FAQ
 
