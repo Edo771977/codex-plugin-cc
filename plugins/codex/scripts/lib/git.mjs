@@ -8,13 +8,22 @@ const MAX_UNTRACKED_BYTES = 24 * 1024;
 const DEFAULT_INLINE_DIFF_MAX_FILES = 2;
 const DEFAULT_INLINE_DIFF_MAX_BYTES = 256 * 1024;
 
+// Print non-ASCII paths as they are; with the default core.quotePath, git shows café.js as
+// "caf\303\251.js", which neither matches the file on disk nor reads well in a prompt.
+const GIT_CONFIG_ARGS = ["-c", "core.quotePath=false"];
+
 // Git is directly executable on Windows. Repository-derived arguments must never pass through a shell.
 function git(cwd, args, options = {}) {
-  return runCommand("git", args, { cwd, ...options, shell: false });
+  return runCommand("git", [...GIT_CONFIG_ARGS, ...args], { cwd, ...options, shell: false });
 }
 
 function gitChecked(cwd, args, options = {}) {
-  return runCommandChecked("git", args, { cwd, ...options, shell: false });
+  return runCommandChecked("git", [...GIT_CONFIG_ARGS, ...args], { cwd, ...options, shell: false });
+}
+
+// NUL-separated output keeps every file name intact, whatever characters it contains.
+function listFilesZ(cwd, args) {
+  return String(gitChecked(cwd, [...args, "-z"]).stdout).split("\0").filter(Boolean);
 }
 
 function listUniqueFiles(...groups) {
@@ -120,9 +129,9 @@ export function getCurrentBranch(cwd) {
 }
 
 export function getWorkingTreeState(cwd) {
-  const staged = gitChecked(cwd, ["diff", "--cached", "--name-only"]).stdout.trim().split("\n").filter(Boolean);
-  const unstaged = gitChecked(cwd, ["diff", "--name-only"]).stdout.trim().split("\n").filter(Boolean);
-  const untracked = gitChecked(cwd, ["ls-files", "--others", "--exclude-standard"]).stdout.trim().split("\n").filter(Boolean);
+  const staged = listFilesZ(cwd, ["diff", "--cached", "--name-only"]);
+  const unstaged = listFilesZ(cwd, ["diff", "--name-only"]);
+  const untracked = listFilesZ(cwd, ["ls-files", "--others", "--exclude-standard"]);
 
   return {
     staged,
@@ -191,7 +200,9 @@ export function resolveReviewTarget(cwd, options = {}) {
 }
 
 function formatSection(title, body) {
-  return [`## ${title}`, "", body.trim() ? body.trim() : "(none)", ""].join("\n");
+  // Keep leading spaces: `git status --short` puts the index column first, and it is often blank.
+  const text = String(body ?? "").replace(/^(?:[ \t]*\n)+/, "").trimEnd();
+  return [`## ${title}`, "", text.trim() ? text : "(none)", ""].join("\n");
 }
 
 function formatUntrackedFile(cwd, relativePath) {
@@ -224,7 +235,7 @@ function formatUntrackedFile(cwd, relativePath) {
 
 function collectWorkingTreeContext(cwd, state, options = {}) {
   const includeDiff = options.includeDiff !== false;
-  const status = gitChecked(cwd, ["status", "--short", "--untracked-files=all"]).stdout.trim();
+  const status = gitChecked(cwd, ["status", "--short", "--untracked-files=all"]).stdout.trimEnd();
   const changedFiles = listUniqueFiles(state.staged, state.unstaged, state.untracked);
 
   let parts;
@@ -263,7 +274,7 @@ function collectBranchContext(cwd, baseRef, options = {}) {
   const includeDiff = options.includeDiff !== false;
   const comparison = options.comparison ?? buildBranchComparison(cwd, baseRef);
   const currentBranch = getCurrentBranch(cwd);
-  const changedFiles = gitChecked(cwd, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean);
+  const changedFiles = listFilesZ(cwd, ["diff", "--name-only", comparison.commitRange]);
   const logOutput = gitChecked(cwd, ["log", "--oneline", "--decorate", comparison.commitRange]).stdout.trim();
   const diffStat = gitChecked(cwd, ["diff", "--stat", comparison.commitRange]).stdout.trim();
 
@@ -323,7 +334,7 @@ export function collectReviewContext(cwd, target, options = {}) {
     details = collectWorkingTreeContext(repoRoot, state, { includeDiff });
   } else {
     const comparison = buildBranchComparison(repoRoot, target.baseRef);
-    const fileCount = gitChecked(repoRoot, ["diff", "--name-only", comparison.commitRange]).stdout.trim().split("\n").filter(Boolean).length;
+    const fileCount = listFilesZ(repoRoot, ["diff", "--name-only", comparison.commitRange]).length;
     diffBytes = measureGitOutputBytes(
       repoRoot,
       ["diff", "--binary", "--no-ext-diff", "--submodule=diff", comparison.commitRange],
