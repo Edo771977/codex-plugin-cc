@@ -34,6 +34,7 @@
 - Kill an app-server that ignores both the close and SIGTERM: the SIGKILL meant for it sat on a timer that the broker's own exit always cancelled. On the idle and app-server-exit paths that is the whole fix; the session-end hook still reports such a broker as not exited, because it stops waiting before the broker's five-second close grace ends, but the tree is gone shortly after.
 - Keep apostrophes and backslashes in a slash command's raw arguments: quotes group words only when they open a token or follow "=" and are closed, and a backslash escapes only quotes, whitespace and backslashes, so "the user's bug" no longer swallows the flags after it (openai/codex-plugin-cc#816).
 - Keep the first column of `git status --short` and non-ASCII file names in the review context, by trimming only trailing whitespace and running git with `core.quotePath=false` and `-z` file lists (openai/codex-plugin-cc#817).
+- Keep a `\|` inside a `/codex:status` table cell from splitting the row, by doubling the backslashes in front of a pipe before escaping it (openai/codex-plugin-cc#831).
 
 ## 1.0.0
 

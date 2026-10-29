@@ -467,6 +467,7 @@ Broker and background-job lifecycle:
 | [#800](https://github.com/openai/codex-plugin-cc/pull/800) | shortening a thread name or job summary no longer cuts a surrogate pair in half, which left a lone surrogate in the JSON and made the app-server drop the request |
 | [#809](https://github.com/openai/codex-plugin-cc/pull/809) | a turn whose `turn/start` response carries no turn id still completes: notifications were held until an id turned up, so every later one, `turn/completed` included, sat in the buffer and the run never finished |
 | [#817](https://github.com/openai/codex-plugin-cc/pull/817) | the review context keeps the first column of `git status --short` (an unstaged change lost its leading space) and non-ASCII file names: with git's default `core.quotePath`, an untracked `café.js` was listed under a quoted name that does not exist on disk and left out of the review |
+| [#831](https://github.com/openai/codex-plugin-cc/pull/831) | a `/codex:status` table cell that already holds `\\|` no longer splits the row: the backslashes in front of a pipe are doubled before the pipe is escaped |
 
 Commands and flags:
 
