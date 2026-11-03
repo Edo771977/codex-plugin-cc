@@ -39,7 +39,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { readJsonFile, renameReplacing } from "./fs.mjs";
+import { readJsonFile, renameReplacing, sleepSync } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
@@ -50,6 +50,9 @@ const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const LEDGER_REWRITE_ATTEMPTS = 5;
+// Codex writes the ledger with a plain truncate-and-write, so a read can land on a half-written file.
+const LEDGER_READ_ATTEMPTS = 5;
+const LEDGER_READ_RETRY_MS = 50;
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
 const SCOPED_PERMISSION_PROFILE = "claude_companion_scoped";
 
@@ -813,47 +816,116 @@ function importLedgerPath() {
   return path.join(resolveCodexHome(), "external_agent_session_imports.json");
 }
 
-function readImportLedger() {
-  const ledgerPath = importLedgerPath();
-  return fs.existsSync(ledgerPath) ? readJsonFile(ledgerPath) : null;
+/**
+ * The form of a transcript path the ledger can be compared on.
+ *
+ * Codex records `source_path` through Rust's `std::fs::canonicalize`, which on Windows returns an
+ * extended-length path (`\\?\C:\...`, or `\\?\UNC\server\share\...`), while Node's realpath
+ * returns `C:\...`. Windows paths are also case-insensitive. Compared as raw strings, a transcript
+ * Codex already imported would never match its own record there.
+ */
+export function ledgerPathKey(value, platform = process.platform) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  if (platform !== "win32") {
+    return value;
+  }
+  let normalized = value;
+  if (normalized.startsWith("\\\\?\\UNC\\")) {
+    normalized = `\\\\${normalized.slice(8)}`;
+  } else if (normalized.startsWith("\\\\?\\")) {
+    normalized = normalized.slice(4);
+  }
+  return normalized.toLowerCase();
+}
+
+function isRecordForSource(record, canonicalSource) {
+  const key = ledgerPathKey(record?.source_path);
+  return key !== null && key === ledgerPathKey(canonicalSource);
+}
+
+/** The ledger's text and parsed content, retried over a half-written file; null when absent. */
+function readImportLedgerText(ledgerPath) {
+  for (let attempt = 1; ; attempt += 1) {
+    let text;
+    try {
+      text = fs.readFileSync(ledgerPath, "utf8");
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        return null;
+      }
+      throw error;
+    }
+    try {
+      return { text, ledger: JSON.parse(text) };
+    } catch (error) {
+      if (attempt >= LEDGER_READ_ATTEMPTS) {
+        throw new Error(`Could not read Codex's import ledger at ${ledgerPath}: ${error.message}`);
+      }
+      sleepSync(LEDGER_READ_RETRY_MS);
+    }
+  }
 }
 
 function importRecordsForSource(canonicalSource) {
-  const ledger = readImportLedger();
-  const records = Array.isArray(ledger?.records) ? ledger.records : [];
+  const read = readImportLedgerText(importLedgerPath());
+  const records = Array.isArray(read?.ledger?.records) ? read.ledger.records : [];
   return records.filter(
-    (record) => record?.source_path === canonicalSource && typeof record?.imported_thread_id === "string"
+    (record) => isRecordForSource(record, canonicalSource) && typeof record?.imported_thread_id === "string"
   );
 }
 
 // Codex writes the ledger without a lock the plugin could share, so rewrites are optimistic:
 // re-read the ledger right before the rename and start over if another import changed it.
 // `update` returns the new records, or null to leave the ledger as it is.
+//
+// The rename replaces the file the ledger path resolves to, not the path itself: a ledger that is a
+// symlink (a dotfiles manager's, say) stays one, and its target is what gets the update. The
+// replacement and the backup keep the ledger's own mode, and every name written here is unique,
+// so nothing — another process's temp file or an earlier backup — is ever overwritten.
 function rewriteImportLedger(update, { backup = false } = {}) {
   const ledgerPath = importLedgerPath();
   for (let attempt = 0; attempt < LEDGER_REWRITE_ATTEMPTS; attempt += 1) {
-    if (!fs.existsSync(ledgerPath)) {
+    let realLedger;
+    try {
+      realLedger = fs.realpathSync(ledgerPath);
+    } catch (error) {
+      if (error?.code === "ENOENT") {
+        return null;
+      }
+      throw error;
+    }
+    const read = readImportLedgerText(realLedger);
+    if (!read) {
       return null;
     }
-    const original = fs.readFileSync(ledgerPath, "utf8");
-    const ledger = JSON.parse(original);
+    const { text: original, ledger } = read;
     const records = Array.isArray(ledger?.records) ? ledger.records : [];
     const nextRecords = update(records);
     if (!nextRecords) {
       return null;
     }
-    const tempPath = `${ledgerPath}.tmp-${process.pid}`;
-    fs.writeFileSync(tempPath, `${JSON.stringify({ ...ledger, records: nextRecords }, null, 2)}\n`);
-    if (fs.readFileSync(ledgerPath, "utf8") !== original) {
+    const mode = fs.statSync(realLedger).mode & 0o777;
+    const unique = () => `${process.pid}-${crypto.randomBytes(6).toString("hex")}`;
+    const tempPath = `${realLedger}.tmp-${unique()}`;
+    fs.writeFileSync(tempPath, `${JSON.stringify({ ...ledger, records: nextRecords }, null, 2)}\n`, { flag: "wx", mode });
+    try {
+      // The umask can narrow the mode given at creation; the ledger's own mode is what it gets.
+      fs.chmodSync(tempPath, mode);
+      if (fs.readFileSync(realLedger, "utf8") !== original) {
+        continue;
+      }
+      const backupPath = backup ? `${ledgerPath}.bak-${Date.now()}-${unique()}` : null;
+      if (backupPath) {
+        fs.writeFileSync(backupPath, original, { flag: "wx", mode });
+        fs.chmodSync(backupPath, mode);
+      }
+      renameReplacing(tempPath, realLedger);
+      return { records, backupPath };
+    } finally {
       fs.rmSync(tempPath, { force: true });
-      continue;
     }
-    const backupPath = backup ? `${ledgerPath}.bak-${Date.now()}` : null;
-    if (backupPath) {
-      fs.writeFileSync(backupPath, original);
-    }
-    renameReplacing(tempPath, ledgerPath);
-    return { records, backupPath };
   }
   throw new Error("Codex's import ledger kept changing while the plugin tried to update it. Retry in a moment.");
 }
@@ -864,7 +936,7 @@ function rewriteImportLedger(update, { backup = false } = {}) {
 export function forgetImportRecordsForSource(canonicalSource) {
   const result = rewriteImportLedger(
     (records) => {
-      const kept = records.filter((record) => record?.source_path !== canonicalSource);
+      const kept = records.filter((record) => !isRecordForSource(record, canonicalSource));
       return kept.length === records.length ? null : kept;
     },
     { backup: true }
@@ -872,7 +944,7 @@ export function forgetImportRecordsForSource(canonicalSource) {
   if (!result) {
     return { removed: 0, removedRecords: [], backupPath: null };
   }
-  const removedRecords = result.records.filter((record) => record?.source_path === canonicalSource);
+  const removedRecords = result.records.filter((record) => isRecordForSource(record, canonicalSource));
   return { removed: removedRecords.length, removedRecords, backupPath: result.backupPath };
 }
 
@@ -882,7 +954,7 @@ export function restoreImportRecordsForSource(canonicalSource, removedRecords) {
     return false;
   }
   const result = rewriteImportLedger((records) =>
-    records.some((record) => record?.source_path === canonicalSource) ? null : [...records, ...removedRecords]
+    records.some((record) => isRecordForSource(record, canonicalSource)) ? null : [...records, ...removedRecords]
   );
   return Boolean(result);
 }

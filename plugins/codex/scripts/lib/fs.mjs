@@ -44,7 +44,7 @@ export function writePrivateFile(filePath, value) {
 const WINDOWS_RENAME_RETRY_DELAYS_MS = [5, 15, 40, 100];
 const WINDOWS_RENAME_RETRY_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
 
-function sleepSync(ms) {
+export function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
