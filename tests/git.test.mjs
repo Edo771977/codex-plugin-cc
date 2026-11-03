@@ -3,7 +3,7 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { collectReviewContext, resolveReviewTarget } from "../plugins/codex/scripts/lib/git.mjs";
+import { collectReviewContext, readRegularFileNoFollow, resolveReviewTarget } from "../plugins/codex/scripts/lib/git.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
 test("resolveReviewTarget prefers working tree when repo is dirty", () => {
@@ -260,4 +260,23 @@ test("collectReviewContext keeps the first status column and non-ASCII file name
   assert.match(context.content, /## Git Status\n\n M a\.js\n\?\? café\.js\n/);
   assert.ok(context.changedFiles.includes("café.js"), JSON.stringify(context.changedFiles));
   assert.match(context.content, /const café = 1;/);
+});
+
+test("readRegularFileNoFollow refuses a symlink even when it was a regular file a moment ago", { skip: process.platform === "win32" }, () => {
+  // The lstat in formatUntrackedFile can be outrun: the file is swapped for a symlink between that
+  // check and the read. The read must refuse the link on its own.
+  const dir = makeTempDir();
+  const outside = path.join(makeTempDir(), "secret.txt");
+  fs.writeFileSync(outside, "secret contents\n");
+  const target = path.join(dir, "notes.txt");
+  fs.symlinkSync(outside, target);
+
+  assert.deepEqual(readRegularFileNoFollow(target, 1024), { skipped: "symlink" });
+
+  fs.unlinkSync(target);
+  fs.writeFileSync(target, "plain\n");
+  assert.equal(String(readRegularFileNoFollow(target, 1024).buffer), "plain\n");
+  assert.deepEqual(readRegularFileNoFollow(target, 2), { skipped: "6 bytes exceeds 2 byte limit" });
+  assert.deepEqual(readRegularFileNoFollow(dir, 1024), { skipped: "not a regular file" });
+  assert.deepEqual(readRegularFileNoFollow(path.join(dir, "missing"), 1024), { skipped: "unreadable file" });
 });

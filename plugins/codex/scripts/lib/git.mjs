@@ -205,6 +205,38 @@ function formatSection(title, body) {
   return [`## ${title}`, "", text.trim() ? text : "(none)", ""].join("\n");
 }
 
+/**
+ * Read a regular file without following a symlink, or say why it was skipped.
+ *
+ * The lstat check before this runs is a separate step: between it and the read, the file can be
+ * replaced by a symlink to something outside the repository, and a plain readFileSync would follow
+ * it into the review prompt. O_NOFOLLOW refuses a symlink at open, and the open descriptor is the
+ * one checked and read, so what is read is what was checked. Windows has no O_NOFOLLOW; there the
+ * lstat check is all there is.
+ */
+export function readRegularFileNoFollow(absolutePath, maxBytes) {
+  let fd;
+  try {
+    fd = fs.openSync(absolutePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  } catch (error) {
+    return { skipped: error?.code === "ELOOP" ? "symlink" : "unreadable file" };
+  }
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) {
+      return { skipped: "not a regular file" };
+    }
+    if (stat.size > maxBytes) {
+      return { skipped: `${stat.size} bytes exceeds ${maxBytes} byte limit` };
+    }
+    return { buffer: fs.readFileSync(fd) };
+  } catch {
+    return { skipped: "unreadable file" };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function formatUntrackedFile(cwd, relativePath) {
   const absolutePath = path.join(cwd, relativePath);
   let stat;
@@ -227,12 +259,11 @@ function formatUntrackedFile(cwd, relativePath) {
     return `### ${relativePath}\n(skipped: ${stat.size} bytes exceeds ${MAX_UNTRACKED_BYTES} byte limit)`;
   }
 
-  let buffer;
-  try {
-    buffer = fs.readFileSync(absolutePath);
-  } catch {
-    return `### ${relativePath}\n(skipped: unreadable file)`;
+  const read = readRegularFileNoFollow(absolutePath, MAX_UNTRACKED_BYTES);
+  if (read.skipped) {
+    return `### ${relativePath}\n(skipped: ${read.skipped})`;
   }
+  const buffer = read.buffer;
   if (!isProbablyText(buffer)) {
     return `### ${relativePath}\n(skipped: binary file)`;
   }
