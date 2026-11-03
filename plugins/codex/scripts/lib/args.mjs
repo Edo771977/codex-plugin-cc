@@ -153,3 +153,24 @@ export function splitRawArgumentString(raw) {
   finish();
   return tokens;
 }
+
+/**
+ * Quote one value so that splitRawArgumentString() gives it back unchanged — for a command line
+ * printed for the user to run as a slash command.
+ *
+ * Quotes there hold their content literally (no escapes inside), so a value is wrapped in the
+ * quote it does not contain; one containing both is escaped character by character instead.
+ */
+export function quoteRawArgument(value) {
+  const text = String(value);
+  if (text !== "" && !/[\s"'\\]/.test(text)) {
+    return text;
+  }
+  if (!text.includes("'")) {
+    return `'${text}'`;
+  }
+  if (!text.includes("\"")) {
+    return `"${text}"`;
+  }
+  return text.replace(/["'\\ \t]/g, (character) => `\\${character}`);
+}

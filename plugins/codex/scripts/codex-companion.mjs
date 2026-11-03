@@ -6,7 +6,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
+import { parseArgs, quoteRawArgument, splitRawArgumentString } from "./lib/args.mjs";
 import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
@@ -733,7 +733,7 @@ async function executeTransfer(cwd, options = {}) {
     prepared.cleanup();
   }
   // Keep an explicit --source in the hint; without it, --refresh would resolve the session's own transcript.
-  const sourceArgument = /[\s"'\\]/.test(sourcePath) ? JSON.stringify(sourcePath) : sourcePath;
+  const sourceArgument = quoteRawArgument(sourcePath);
   const refreshCommand =
     result.alreadyImported && !result.upToDate
       ? `/codex:transfer --refresh${options.source ? ` --source ${sourceArgument}` : ""}`

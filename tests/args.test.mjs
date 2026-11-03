@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { parseArgs, splitRawArgumentString } from "../plugins/codex/scripts/lib/args.mjs";
+import { parseArgs, quoteRawArgument, splitRawArgumentString } from "../plugins/codex/scripts/lib/args.mjs";
 
 const REVIEW_CONFIG = {
   valueOptions: ["base", "scope", "model", "effort", "cwd"],
@@ -193,4 +193,21 @@ test("whitespace is collapsed and empty input gives no tokens", () => {
   assert.deepEqual(splitRawArgumentString("  spaced   out  "), ["spaced", "out"]);
   assert.deepEqual(splitRawArgumentString(""), []);
   assert.deepEqual(splitRawArgumentString(null), []);
+});
+
+test("quoteRawArgument gives back every value through splitRawArgumentString", () => {
+  // The /codex:transfer --refresh hint prints a --source path for the user to run again.
+  for (const value of [
+    "/home/me/.claude/projects/-repo/s.jsonl",
+    "/home/me/My Projects/s.jsonl",
+    "/home/a\"b/x.jsonl",
+    "/home/it's/x.jsonl",
+    "/home/it's \"both\"/x.jsonl",
+    String.raw`C:\Users\me\s.jsonl`,
+    String.raw`C:\Users\it's "both"\s.jsonl`,
+    "tab\there",
+    ""
+  ]) {
+    assert.deepEqual(splitRawArgumentString(`--source ${quoteRawArgument(value)} --refresh`), ["--source", value, "--refresh"], value);
+  }
 });
