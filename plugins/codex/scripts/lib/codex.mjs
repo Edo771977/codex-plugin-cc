@@ -39,7 +39,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { readJsonFile } from "./fs.mjs";
+import { readJsonFile, renameReplacing } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
@@ -852,7 +852,7 @@ function rewriteImportLedger(update, { backup = false } = {}) {
     if (backupPath) {
       fs.writeFileSync(backupPath, original);
     }
-    fs.renameSync(tempPath, ledgerPath);
+    renameReplacing(tempPath, ledgerPath);
     return { records, backupPath };
   }
   throw new Error("Codex's import ledger kept changing while the plugin tried to update it. Retry in a moment.");
