@@ -701,7 +701,7 @@ function renderTransferResult(payload) {
     const lines = [
       payload.upToDate
         ? `This Claude session was already transferred to Codex${when}, and the transcript has not changed since.`
-        : `This Claude session was already transferred to Codex${when}. Codex imports a transcript only once, so that thread does not include later turns.`,
+        : `This Claude session was already transferred to Codex${when}. Codex skipped it this time instead of importing it again, so that thread does not include later turns.`,
       `Codex session ID: ${payload.threadId}`,
       `Resume in Codex: ${payload.resumeCommand}`
     ];
