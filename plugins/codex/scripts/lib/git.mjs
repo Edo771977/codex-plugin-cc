@@ -205,23 +205,52 @@ function formatSection(title, body) {
   return [`## ${title}`, "", text.trim() ? text : "(none)", ""].join("\n");
 }
 
+/** The real path of an open descriptor where the system can say (Linux), or null. */
+function openedFilePath(fd) {
+  try {
+    return fs.readlinkSync(`/proc/self/fd/${fd}`);
+  } catch {
+    return null;
+  }
+}
+
+function isInside(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
 /**
- * Read a regular file without following a symlink, or say why it was skipped.
+ * Read a regular file without following a symlink out of `rootDir`, or say why it was skipped.
  *
- * The lstat check before this runs is a separate step: between it and the read, the file can be
- * replaced by a symlink to something outside the repository, and a plain readFileSync would follow
- * it into the review prompt. O_NOFOLLOW refuses a symlink at open, and the open descriptor is the
- * one checked and read, so what is read is what was checked. Windows has no O_NOFOLLOW; there the
- * lstat check is all there is.
+ * The lstat check before this runs is a separate step: between it and the read, the file — or a
+ * directory above it — can be replaced by a symlink to something outside the repository, and a
+ * plain readFileSync would follow it into the review prompt. So:
+ * - O_NOFOLLOW refuses a symlink in the last component at open;
+ * - the file that was actually opened must still lie inside `rootDir`, which catches a directory
+ *   above it swapped for a link (read from the descriptor itself on Linux; elsewhere from the
+ *   path's realpath, which narrows that window without closing it);
+ * - O_NONBLOCK keeps a FIFO swapped in from blocking the open forever;
+ * - the descriptor that was checked is the one read, and never past `maxBytes`, even if the file
+ *   grows after the size check.
+ * Windows has no O_NOFOLLOW or O_NONBLOCK; there the lstat check and the containment check apply.
  */
-export function readRegularFileNoFollow(absolutePath, maxBytes) {
+export function readRegularFileNoFollow(absolutePath, maxBytes, rootDir = null) {
   let fd;
   try {
-    fd = fs.openSync(absolutePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    fd = fs.openSync(
+      absolutePath,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0)
+    );
   } catch (error) {
     return { skipped: error?.code === "ELOOP" ? "symlink" : "unreadable file" };
   }
   try {
+    if (rootDir) {
+      const opened = openedFilePath(fd) ?? fs.realpathSync(absolutePath);
+      if (!isInside(fs.realpathSync(rootDir), opened)) {
+        return { skipped: "outside the repository" };
+      }
+    }
     const stat = fs.fstatSync(fd);
     if (!stat.isFile()) {
       return { skipped: "not a regular file" };
@@ -229,7 +258,19 @@ export function readRegularFileNoFollow(absolutePath, maxBytes) {
     if (stat.size > maxBytes) {
       return { skipped: `${stat.size} bytes exceeds ${maxBytes} byte limit` };
     }
-    return { buffer: fs.readFileSync(fd) };
+    const buffer = Buffer.alloc(maxBytes + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const read = fs.readSync(fd, buffer, length, buffer.length - length, length);
+      if (read === 0) {
+        break;
+      }
+      length += read;
+    }
+    if (length > maxBytes) {
+      return { skipped: `grew past the ${maxBytes} byte limit while being read` };
+    }
+    return { buffer: buffer.subarray(0, length) };
   } catch {
     return { skipped: "unreadable file" };
   } finally {
@@ -259,7 +300,7 @@ function formatUntrackedFile(cwd, relativePath) {
     return `### ${relativePath}\n(skipped: ${stat.size} bytes exceeds ${MAX_UNTRACKED_BYTES} byte limit)`;
   }
 
-  const read = readRegularFileNoFollow(absolutePath, MAX_UNTRACKED_BYTES);
+  const read = readRegularFileNoFollow(absolutePath, MAX_UNTRACKED_BYTES, cwd);
   if (read.skipped) {
     return `### ${relativePath}\n(skipped: ${read.skipped})`;
   }
