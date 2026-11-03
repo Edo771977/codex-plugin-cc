@@ -575,11 +575,13 @@ test("transfer fails visibly when native import completes without a ledger recor
   assert.match(result.stderr, /did not record an imported thread/);
 });
 
-function setupTransferFixture(behavior) {
+function setupTransferFixture(behavior, { relocatedConfig = false } = {}) {
   const home = makeTempDir();
   const repo = path.join(home, "repo");
   const binDir = makeTempDir();
-  const projectDir = path.join(home, ".claude", "projects", "-repo");
+  // A relocated CLAUDE_CONFIG_DIR makes the transfer stage a copy under ~/.claude/projects.
+  const claudeConfigDir = relocatedConfig ? path.join(home, ".claude-work") : null;
+  const projectDir = path.join(claudeConfigDir ?? path.join(home, ".claude"), "projects", "-repo");
   const sourcePath = path.join(projectDir, "session.jsonl");
   fs.mkdirSync(repo, { recursive: true });
   fs.mkdirSync(projectDir, { recursive: true });
@@ -595,7 +597,8 @@ function setupTransferFixture(behavior) {
     ...buildEnv(binDir),
     HOME: home,
     CODEX_HOME: codexHome,
-    CODEX_COMPANION_TRANSCRIPT_PATH: sourcePath
+    CODEX_COMPANION_TRANSCRIPT_PATH: sourcePath,
+    ...(claudeConfigDir ? { CLAUDE_CONFIG_DIR: claudeConfigDir } : {})
   };
   // Commands receive "$ARGUMENTS" as a single argv element, so pass options the same way.
   const transfer = (rawArguments) => run("node", [SCRIPT, "transfer", rawArguments], { cwd: repo, env });
@@ -605,8 +608,48 @@ function setupTransferFixture(behavior) {
     JSON.parse(fs.readFileSync(path.join(codexHome, "external_agent_session_imports.json"), "utf8")).records;
   const fakeThreads = () => JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8")).threads;
   const useBehavior = (nextBehavior) => installFakeCodex(binDir, nextBehavior);
-  return { codexHome, sourcePath, transfer, appendTurn, ledgerRecords, fakeThreads, useBehavior };
+  return { home, codexHome, sourcePath, transfer, appendTurn, ledgerRecords, fakeThreads, useBehavior };
 }
+
+test("already-imported detection and --refresh work on the staged copy of a relocated CLAUDE_CONFIG_DIR", () => {
+  // The fork imports a relocated transcript from a copy staged under ~/.claude/projects, so that
+  // copy's path is the one Codex records, and the copy is gone once the transfer returns.
+  const fixture = setupTransferFixture(undefined, { relocatedConfig: true });
+  const stagedPath = path.join(fixture.home, ".claude", "projects", "-repo", "session.jsonl");
+
+  const first = JSON.parse(fixture.transfer("--json").stdout);
+  assert.equal(first.threadId, "thr_1");
+  assert.deepEqual(fixture.ledgerRecords().map((record) => record.source_path), [stagedPath]);
+  assert.equal(fs.existsSync(stagedPath), false, "the staged copy is cleaned up");
+
+  const unchanged = JSON.parse(fixture.transfer("--json").stdout);
+  assert.equal(unchanged.alreadyImported, true);
+  assert.equal(unchanged.upToDate, true);
+  assert.equal(unchanged.threadId, "thr_1");
+
+  fixture.appendTurn("More work after the first transfer.");
+  const grown = JSON.parse(fixture.transfer("--json").stdout);
+  assert.equal(grown.alreadyImported, true);
+  assert.equal(grown.upToDate, false);
+  assert.equal(grown.refreshCommand, "/codex:transfer --refresh");
+
+  const refreshed = fixture.transfer("--refresh --json");
+  assert.equal(refreshed.status, 0, refreshed.stderr);
+  assert.equal(JSON.parse(refreshed.stdout).threadId, "thr_2");
+  assert.deepEqual(
+    fixture.ledgerRecords().map((record) => [record.source_path, record.imported_thread_id]),
+    [[stagedPath, "thr_2"]]
+  );
+  assert.equal(fs.existsSync(stagedPath), false);
+
+  fixture.appendTurn("Even more work.");
+  fixture.useBehavior("external-import-reports-failure");
+  const rejected = fixture.transfer("--refresh");
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /earlier import record for this transcript was restored/);
+  assert.deepEqual(fixture.ledgerRecords().map((record) => record.imported_thread_id), ["thr_2"]);
+  assert.equal(fs.existsSync(stagedPath), false);
+});
 
 test("transfer reports an already-imported session instead of failing", () => {
   const fixture = setupTransferFixture();
