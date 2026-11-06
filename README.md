@@ -241,9 +241,12 @@ Examples:
 ```bash
 /codex:transfer
 /codex:transfer --source ~/.claude/projects/-Users-me-repo/<session-id>.jsonl
+/codex:transfer --refresh
 ```
 
 The plugin's existing `SessionStart` hook supplies the current transcript path automatically; `--source` is available as a manual override. The transfer uses Codex's external-agent session importer, so it follows the same conversion rules as importing Claude history in the Codex App and creates visible turns that can be continued in the App or TUI. The source must live under a Claude projects root — `~/.claude/projects`, or `$CLAUDE_CONFIG_DIR/projects` when you have relocated your Claude config — and older Codex versions that do not expose session import must be upgraded before using this command.
+
+Codex versions that import each Claude transcript only once (0.166 among them) skip a transcript they have already imported, even after it has grown. If the session was already transferred (by this command or by importing Claude history in the Codex App), `/codex:transfer` prints the existing thread instead and says whether later turns are missing from it. `--refresh` removes the earlier import record from `$CODEX_HOME/external_agent_session_imports.json` (a backup is written next to it) and imports the current transcript into a new Codex thread; the earlier thread is left unchanged.
 
 ### `/codex:status`
 
@@ -468,6 +471,7 @@ Broker and background-job lifecycle:
 | [#809](https://github.com/openai/codex-plugin-cc/pull/809) | a turn whose `turn/start` response carries no turn id still completes: notifications were held until an id turned up, so every later one, `turn/completed` included, sat in the buffer and the run never finished |
 | [#817](https://github.com/openai/codex-plugin-cc/pull/817) | the review context keeps the first column of `git status --short` (an unstaged change lost its leading space) and non-ASCII file names: with git's default `core.quotePath`, an untracked `café.js` was listed under a quoted name that does not exist on disk and left out of the review |
 | [#831](https://github.com/openai/codex-plugin-cc/pull/831) | a `/codex:status` table cell that already holds `\\|` no longer splits the row: the backslashes in front of a pipe are doubled before the pipe is escaped |
+| [#834](https://github.com/openai/codex-plugin-cc/pull/834) | an untracked symlink is no longer followed into the review prompt: a link to a file outside the repository put that file's contents in front of Codex |
 
 Commands and flags:
 
@@ -489,6 +493,7 @@ Commands and flags:
 | [#808](https://github.com/openai/codex-plugin-cc/pull/808) | tests only: inline `--key=value` keeps every `=` after the first. The parser already split there, so only the tests are taken; one is adapted, since this fork rejects a boolean value other than `true`/`false` where upstream reads `--flag=false=extra` as true |
 | [#811](https://github.com/openai/codex-plugin-cc/pull/811) | `scripts/bump-version.mjs --help` lists the `-h` alias it already accepted |
 | [#816](https://github.com/openai/codex-plugin-cc/pull/816) | a slash command's raw arguments keep apostrophes and backslashes: `fix the user's bug --background` no longer swallows `--background` into the prompt, and `C:\Users\x` or `\d+` keep their backslashes (its `--key=value` half was already here) |
+| [#835](https://github.com/openai/codex-plugin-cc/pull/835) | `/codex:transfer` of a session Codex already imported prints that thread and says whether later turns are missing from it, instead of failing with "did not record an imported thread"; `--refresh` re-imports the current transcript into a new thread |
 
 Where two of these PRs disagreed, the merge commit says which side won and why. The plugin version
 is deliberately left at the upstream number: these merges do not cut a release.
@@ -559,6 +564,16 @@ Beyond the imports, this fork carries fixes for defects the imports themselves s
   returns, so that timer never fired. The session-end hook still reports such a broker as not
   exited — it stops waiting before the broker's five-second close grace runs out — but the tree is
   gone a second after that
+- reading an untracked file for the review cannot be raced out of the repository: after #834's
+  lstat, the file is opened with O_NOFOLLOW and O_NONBLOCK, the file actually opened must lie
+  inside the repository (which catches a directory above it swapped for a link), and the read never
+  goes past the size limit. Outside Linux the containment check reads the path's realpath, which
+  narrows that window without closing it
+- `/codex:transfer` (#835) matches Codex's ledger on Windows, where Codex records an extended-length
+  `\\?\C:\...` path; and rewriting that ledger for `--refresh` keeps a symlinked ledger a symlink,
+  keeps its mode, never overwrites another temp file or backup, and retries a read that lands on
+  Codex's half-written file. The Windows path handling comes from Codex's source and is not verified
+  on a Windows machine
 - the app-server typecheck (`npm run build`) passes
 
 Each of those came out of an adversarial review of the merges, re-run after every round of fixes;

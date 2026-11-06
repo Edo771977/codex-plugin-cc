@@ -575,6 +575,207 @@ test("transfer fails visibly when native import completes without a ledger recor
   assert.match(result.stderr, /did not record an imported thread/);
 });
 
+function setupTransferFixture(behavior, { relocatedConfig = false } = {}) {
+  const home = makeTempDir();
+  const repo = path.join(home, "repo");
+  const binDir = makeTempDir();
+  // A relocated CLAUDE_CONFIG_DIR makes the transfer stage a copy under ~/.claude/projects.
+  const claudeConfigDir = relocatedConfig ? path.join(home, ".claude-work") : null;
+  const projectDir = path.join(claudeConfigDir ?? path.join(home, ".claude"), "projects", "-repo");
+  const sourcePath = path.join(projectDir, "session.jsonl");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.mkdirSync(projectDir, { recursive: true });
+  installFakeCodex(binDir, behavior);
+  initGitRepo(repo);
+  fs.writeFileSync(
+    sourcePath,
+    `${JSON.stringify({ type: "user", cwd: repo, message: { role: "user", content: "First request." } })}\n`,
+    "utf8"
+  );
+  const codexHome = path.join(home, ".codex");
+  const env = {
+    ...buildEnv(binDir),
+    HOME: home,
+    CODEX_HOME: codexHome,
+    CODEX_COMPANION_TRANSCRIPT_PATH: sourcePath,
+    ...(claudeConfigDir ? { CLAUDE_CONFIG_DIR: claudeConfigDir } : {})
+  };
+  // Commands receive "$ARGUMENTS" as a single argv element, so pass options the same way.
+  const transfer = (rawArguments) => run("node", [SCRIPT, "transfer", rawArguments], { cwd: repo, env });
+  const appendTurn = (content) =>
+    fs.appendFileSync(sourcePath, `${JSON.stringify({ type: "user", cwd: repo, message: { role: "user", content } })}\n`);
+  const ledgerRecords = () =>
+    JSON.parse(fs.readFileSync(path.join(codexHome, "external_agent_session_imports.json"), "utf8")).records;
+  const fakeThreads = () => JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8")).threads;
+  const useBehavior = (nextBehavior) => installFakeCodex(binDir, nextBehavior);
+  return { home, codexHome, sourcePath, transfer, appendTurn, ledgerRecords, fakeThreads, useBehavior };
+}
+
+test("already-imported detection and --refresh work on the staged copy of a relocated CLAUDE_CONFIG_DIR", () => {
+  // The fork imports a relocated transcript from a copy staged under ~/.claude/projects, so that
+  // copy's path is the one Codex records, and the copy is gone once the transfer returns.
+  const fixture = setupTransferFixture(undefined, { relocatedConfig: true });
+  const stagedPath = path.join(fixture.home, ".claude", "projects", "-repo", "session.jsonl");
+
+  const first = JSON.parse(fixture.transfer("--json").stdout);
+  assert.equal(first.threadId, "thr_1");
+  assert.deepEqual(fixture.ledgerRecords().map((record) => record.source_path), [stagedPath]);
+  assert.equal(fs.existsSync(stagedPath), false, "the staged copy is cleaned up");
+
+  const unchanged = JSON.parse(fixture.transfer("--json").stdout);
+  assert.equal(unchanged.alreadyImported, true);
+  assert.equal(unchanged.upToDate, true);
+  assert.equal(unchanged.threadId, "thr_1");
+
+  fixture.appendTurn("More work after the first transfer.");
+  const grown = JSON.parse(fixture.transfer("--json").stdout);
+  assert.equal(grown.alreadyImported, true);
+  assert.equal(grown.upToDate, false);
+  assert.equal(grown.refreshCommand, "/codex:transfer --refresh");
+
+  const refreshed = fixture.transfer("--refresh --json");
+  assert.equal(refreshed.status, 0, refreshed.stderr);
+  assert.equal(JSON.parse(refreshed.stdout).threadId, "thr_2");
+  assert.deepEqual(
+    fixture.ledgerRecords().map((record) => [record.source_path, record.imported_thread_id]),
+    [[stagedPath, "thr_2"]]
+  );
+  assert.equal(fs.existsSync(stagedPath), false);
+
+  fixture.appendTurn("Even more work.");
+  fixture.useBehavior("external-import-reports-failure");
+  const rejected = fixture.transfer("--refresh");
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /earlier import record for this transcript was restored/);
+  assert.deepEqual(fixture.ledgerRecords().map((record) => record.imported_thread_id), ["thr_2"]);
+  assert.equal(fs.existsSync(stagedPath), false);
+});
+
+test("transfer reports an already-imported session instead of failing", () => {
+  const fixture = setupTransferFixture();
+
+  const first = fixture.transfer("--json");
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(JSON.parse(first.stdout).threadId, "thr_1");
+
+  const unchanged = fixture.transfer("--json");
+  assert.equal(unchanged.status, 0, unchanged.stderr);
+  const unchangedPayload = JSON.parse(unchanged.stdout);
+  assert.equal(unchangedPayload.threadId, "thr_1");
+  assert.equal(unchangedPayload.alreadyImported, true);
+  assert.equal(unchangedPayload.upToDate, true);
+
+  fixture.appendTurn("More work after the first transfer.");
+  const grown = fixture.transfer("--json");
+  assert.equal(grown.status, 0, grown.stderr);
+  const grownPayload = JSON.parse(grown.stdout);
+  assert.equal(grownPayload.threadId, "thr_1");
+  assert.equal(grownPayload.alreadyImported, true);
+  assert.equal(grownPayload.upToDate, false);
+  assert.match(grownPayload.importedAt, /^\d{4}-\d{2}-\d{2}T/);
+
+  const rendered = fixture.transfer("");
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.match(rendered.stdout, /already transferred to Codex/);
+  assert.match(rendered.stdout, /codex resume thr_1/);
+  assert.match(rendered.stdout, /\/codex:transfer --refresh/);
+  assert.equal(fixture.fakeThreads().length, 1);
+});
+
+test("transfer --refresh re-imports a grown transcript into a new thread", () => {
+  const fixture = setupTransferFixture();
+  assert.equal(fixture.transfer("").status, 0);
+  fixture.appendTurn("More work after the first transfer.");
+
+  const refreshed = fixture.transfer(`--refresh --source ${fixture.sourcePath} --json`);
+  assert.equal(refreshed.status, 0, refreshed.stderr);
+  const payload = JSON.parse(refreshed.stdout);
+  assert.equal(payload.threadId, "thr_2");
+  assert.equal(payload.alreadyImported, false);
+  assert.equal(payload.refreshed, true);
+  assert.ok(fs.existsSync(payload.ledgerBackupPath), "the previous ledger is backed up");
+  assert.equal(path.dirname(payload.ledgerBackupPath), fixture.codexHome);
+
+  const records = fixture.ledgerRecords();
+  assert.equal(records.length, 1);
+  assert.equal(records[0].imported_thread_id, "thr_2");
+  assert.equal(fixture.fakeThreads().length, 2);
+  assert.deepEqual(
+    fixture.fakeThreads().find((thread) => thread.id === "thr_2").visibleMessages.map((message) => message.text),
+    ["First request.", "More work after the first transfer."]
+  );
+
+  const rendered = fixture.transfer("");
+  assert.match(rendered.stdout, /already transferred to Codex/);
+  assert.match(rendered.stdout, /codex resume thr_2/);
+});
+
+test("transfer keeps an explicit --source in the refresh hint", () => {
+  const fixture = setupTransferFixture();
+  const olderSource = path.join(path.dirname(fixture.sourcePath), "older-session.jsonl");
+  fs.writeFileSync(olderSource, `${JSON.stringify({ type: "user", message: { role: "user", content: "Older request." } })}\n`);
+  assert.equal(fixture.transfer("").status, 0);
+  assert.equal(fixture.transfer(`--source ${olderSource}`).status, 0);
+  fs.appendFileSync(olderSource, `${JSON.stringify({ type: "user", message: { role: "user", content: "Older follow-up." } })}\n`);
+
+  const result = fixture.transfer(`--source ${olderSource} --json`);
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.alreadyImported, true);
+  assert.equal(payload.refreshCommand, `/codex:transfer --refresh --source ${fs.realpathSync(olderSource)}`);
+
+  // Following the hint refreshes the older transcript, not the session's own transcript.
+  const refreshed = fixture.transfer(`${payload.refreshCommand.replace("/codex:transfer ", "")} --json`);
+  assert.equal(refreshed.status, 0, refreshed.stderr);
+  const records = fixture.ledgerRecords();
+  assert.equal(records.find((record) => record.source_path === fs.realpathSync(fixture.sourcePath)).imported_thread_id, "thr_1");
+  assert.equal(records.find((record) => record.source_path === fs.realpathSync(olderSource)).imported_thread_id, "thr_3");
+});
+
+test("transfer --refresh restores the earlier import record when Codex rejects the import", () => {
+  const fixture = setupTransferFixture();
+  assert.equal(fixture.transfer("").status, 0);
+  fixture.appendTurn("More work after the first transfer.");
+
+  for (const behavior of ["external-import-reports-failure", "external-import-unsupported"]) {
+    fixture.useBehavior(behavior);
+    const rejected = fixture.transfer("--refresh");
+    assert.notEqual(rejected.status, 0, behavior);
+    assert.match(rejected.stderr, /earlier import record for this transcript was restored \(ledger backup: .+\)/, behavior);
+    assert.deepEqual(
+      fixture.ledgerRecords().map((record) => record.imported_thread_id),
+      ["thr_1"],
+      behavior
+    );
+  }
+
+  fixture.useBehavior();
+  const afterwards = JSON.parse(fixture.transfer("--json").stdout);
+  assert.equal(afterwards.alreadyImported, true);
+  assert.equal(afterwards.threadId, "thr_1");
+  assert.equal(fixture.fakeThreads().length, 1);
+});
+
+test("transfer surfaces import failures reported by Codex", () => {
+  const fixture = setupTransferFixture("external-import-reports-failure");
+
+  const result = fixture.transfer("");
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Codex could not import the Claude session: unsupported transcript record/);
+});
+
+test("transfer resolves the imported thread when Codex omits results and the transcript keeps growing", () => {
+  const fixture = setupTransferFixture("external-import-legacy-live");
+
+  const result = fixture.transfer("--json");
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.threadId, "thr_1");
+  assert.equal(payload.alreadyImported, false);
+});
+
 test("transfer rejects sources outside the Claude projects directory", () => {
   const home = makeTempDir();
   const repo = path.join(home, "repo");

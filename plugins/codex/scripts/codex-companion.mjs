@@ -6,7 +6,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
+import { parseArgs, quoteRawArgument, splitRawArgumentString } from "./lib/args.mjs";
 import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
@@ -92,7 +92,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|luna|astra>] [--effort <none|minimal|low|medium|high|xhigh>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--ephemeral] [--sandbox <read-only|workspace-write|danger-full-access>] [--read-root <directory> ...] [--resume-last|--resume|--resume-thread <id>|--fresh] [--model <model|spark|sol|luna|astra>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "    --ephemeral: run without persisting the Codex thread. Ephemeral tasks cannot be resumed and do not appear in Codex Recent. Cannot be combined with --resume/--resume-last/--resume-thread.",
-      "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
+      "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--refresh] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
@@ -696,11 +696,28 @@ function buildTaskRequest({
 }
 
 function renderTransferResult(payload) {
+  if (payload.alreadyImported) {
+    const when = payload.importedAt ? ` on ${payload.importedAt}` : "";
+    const lines = [
+      payload.upToDate
+        ? `This Claude session was already transferred to Codex${when}, and the transcript has not changed since.`
+        : `This Claude session was already transferred to Codex${when}. Codex skipped it this time instead of importing it again, so that thread does not include later turns.`,
+      `Codex session ID: ${payload.threadId}`,
+      `Resume in Codex: ${payload.resumeCommand}`
+    ];
+    if (payload.refreshCommand) {
+      lines.push(`To import the current session into a new Codex thread, run \`${payload.refreshCommand}\`.`);
+    }
+    return `${lines.join("\n")}\n`;
+  }
   const lines = [
     "Transferred the Claude session into a Codex thread with visible turn history.",
     `Codex session ID: ${payload.threadId}`,
     `Resume in Codex: ${payload.resumeCommand}`
   ];
+  if (payload.refreshed) {
+    lines.push(`Replaced the earlier import record for this session; the earlier Codex thread is unchanged. Ledger backup: ${payload.ledgerBackupPath}`);
+  }
   return `${lines.join("\n")}\n`;
 }
 
@@ -711,15 +728,27 @@ async function executeTransfer(cwd, options = {}) {
   const prepared = prepareClaudeSessionImport(cwd, sourcePath);
   let result;
   try {
-    result = await importExternalAgentSession(cwd, { sourcePath: prepared.importPath });
+    result = await importExternalAgentSession(cwd, { sourcePath: prepared.importPath, refresh: Boolean(options.refresh) });
   } finally {
     prepared.cleanup();
   }
+  // Keep an explicit --source in the hint; without it, --refresh would resolve the session's own transcript.
+  const sourceArgument = quoteRawArgument(sourcePath);
+  const refreshCommand =
+    result.alreadyImported && !result.upToDate
+      ? `/codex:transfer --refresh${options.source ? ` --source ${sourceArgument}` : ""}`
+      : null;
   const payload = {
     threadId: result.threadId,
     resumeCommand: `codex resume ${result.threadId}`,
     sourcePath,
-    sessionId: path.basename(sourcePath, ".jsonl")
+    sessionId: path.basename(sourcePath, ".jsonl"),
+    alreadyImported: result.alreadyImported,
+    upToDate: result.upToDate,
+    importedAt: result.importedAt,
+    refreshCommand,
+    refreshed: result.refreshed,
+    ledgerBackupPath: result.ledgerBackupPath
   };
 
   return {
@@ -984,12 +1013,13 @@ async function handleTask(argv) {
 async function handleTransfer(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd", "source"],
-    booleanOptions: ["json"]
+    booleanOptions: ["json", "refresh"]
   });
 
   const cwd = resolveCommandCwd(options);
   const { payload, rendered } = await executeTransfer(cwd, {
-    source: options.source
+    source: options.source,
+    refresh: options.refresh
   });
   outputCommandResult(payload, rendered, options.json);
 }

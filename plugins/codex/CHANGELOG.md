@@ -35,6 +35,8 @@
 - Keep apostrophes and backslashes in a slash command's raw arguments: quotes group words only when they open a token or follow "=" and are closed, and a backslash escapes only quotes, whitespace and backslashes, so "the user's bug" no longer swallows the flags after it (openai/codex-plugin-cc#816).
 - Keep the first column of `git status --short` and non-ASCII file names in the review context, by trimming only trailing whitespace and running git with `core.quotePath=false` and `-z` file lists (openai/codex-plugin-cc#817).
 - Keep a `\|` inside a `/codex:status` table cell from splitting the row, by doubling the backslashes in front of a pipe before escaping it (openai/codex-plugin-cc#831).
+- Never follow an untracked symlink into the review prompt (openai/codex-plugin-cc#834), and read untracked files so that a swap between the check and the read cannot reach outside the repository: O_NOFOLLOW and O_NONBLOCK at open, a containment check on the opened file, and a read bounded by the size limit.
+- Report a session Codex already imported in `/codex:transfer` instead of failing with "did not record an imported thread", and add `--refresh` to re-import the current transcript into a new thread (openai/codex-plugin-cc#835). This fork also matches Codex's Windows ledger paths, keeps a symlinked ledger and its mode, names temp files and backups uniquely, retries a half-written ledger, and quotes the printed `--source` the way the slash-command splitter reads it.
 
 ## 1.0.0
 
