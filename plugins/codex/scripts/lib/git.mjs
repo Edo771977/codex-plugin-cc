@@ -76,11 +76,14 @@ function measureCombinedGitOutputBytes(cwd, argSets, maxBytes) {
 }
 
 function buildBranchComparison(cwd, baseRef) {
-  const mergeBase = gitChecked(cwd, ["merge-base", "HEAD", baseRef]).stdout.trim();
+  const headCommit = gitChecked(cwd, ["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"]).stdout.trim();
+  const baseCommit = gitChecked(cwd, ["rev-parse", "--verify", "--end-of-options", `${baseRef}^{commit}`]).stdout.trim();
+  const mergeBase = gitChecked(cwd, ["merge-base", headCommit, baseCommit]).stdout.trim();
   return {
+    headCommit,
     mergeBase,
-    commitRange: `${mergeBase}..HEAD`,
-    reviewRange: `${baseRef}...HEAD`
+    commitRange: `${mergeBase}..${headCommit}`,
+    reviewRange: `${baseCommit}...${headCommit}`
   };
 }
 
@@ -352,7 +355,7 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
 function collectBranchContext(cwd, baseRef, options = {}) {
   const includeDiff = options.includeDiff !== false;
   const comparison = options.comparison ?? buildBranchComparison(cwd, baseRef);
-  const currentBranch = getCurrentBranch(cwd);
+  const currentBranch = options.currentBranch ?? getCurrentBranch(cwd);
   const changedFiles = listFilesZ(cwd, ["diff", "--name-only", comparison.commitRange]);
   const logOutput = gitChecked(cwd, ["log", "--oneline", "--decorate", comparison.commitRange]).stdout.trim();
   const diffStat = gitChecked(cwd, ["diff", "--stat", comparison.commitRange]).stdout.trim();
@@ -380,11 +383,14 @@ function collectBranchContext(cwd, baseRef, options = {}) {
 }
 
 function buildAdversarialCollectionGuidance(options = {}) {
+  const pinnedRange = options.comparison
+    ? ` For this branch review, use the pinned commit range ${options.comparison.commitRange}. Read surrounding file content with \`git show ${options.comparison.headCommit}:<path>\`; the working tree may belong to a different branch.`
+    : "";
   if (options.includeDiff !== false) {
-    return "Use the repository context below as primary evidence.";
+    return `Use the repository context below as primary evidence.${pinnedRange}`;
   }
 
-  return "The repository context below is a lightweight summary. Inspect the target diff yourself with read-only git commands before finalizing findings.";
+  return `The repository context below is a lightweight summary. Inspect the target diff yourself with read-only git commands before finalizing findings.${pinnedRange}`;
 }
 
 export function collectReviewContext(cwd, target, options = {}) {
@@ -420,7 +426,7 @@ export function collectReviewContext(cwd, target, options = {}) {
       maxInlineDiffBytes
     );
     includeDiff = options.includeDiff ?? (fileCount <= maxInlineFiles && diffBytes <= maxInlineDiffBytes);
-    details = collectBranchContext(repoRoot, target.baseRef, { includeDiff, comparison });
+    details = collectBranchContext(repoRoot, target.baseRef, { includeDiff, comparison, currentBranch });
   }
 
   return {
@@ -431,7 +437,7 @@ export function collectReviewContext(cwd, target, options = {}) {
     fileCount: details.changedFiles.length,
     diffBytes,
     inputMode: includeDiff ? "inline-diff" : "self-collect",
-    collectionGuidance: buildAdversarialCollectionGuidance({ includeDiff }),
+    collectionGuidance: buildAdversarialCollectionGuidance({ includeDiff, comparison: details.comparison }),
     ...details
   };
 }

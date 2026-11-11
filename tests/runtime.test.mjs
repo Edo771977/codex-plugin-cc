@@ -141,6 +141,30 @@ test("setup reports not ready when app-server config read fails", () => {
   assert.match(payload.auth.detail, /config\/read failed for cwd/);
 });
 
+test("review passes --effort to the native review as the thread's reasoning effort", () => {
+  // A native review never sends turn/start, the one request with a per-turn effort, so the effort
+  // has to ride on thread/start as a config override (fork issue #19; adapted from upstream #837).
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "app.js"), "export const value = 1;\n");
+  run("git", ["add", "app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "app.js"), "export const value = 2;\n");
+  const lastThreadStart = () =>
+    JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8")).lastThreadStart;
+
+  const withEffort = run("node", [SCRIPT, "review", "--effort", "HIGH"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(withEffort.status, 0, withEffort.stderr);
+  assert.deepEqual(lastThreadStart().config, { model_reasoning_effort: "high" });
+
+  // Without --effort nothing is sent, so the user's config.toml still decides.
+  const withoutEffort = run("node", [SCRIPT, "review"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(withoutEffort.status, 0, withoutEffort.stderr);
+  assert.equal(lastThreadStart().config, undefined);
+});
+
 test("review renders a no-findings result from app-server review/start", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
