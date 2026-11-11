@@ -140,7 +140,7 @@ Use it when you want:
 - a review of your current uncommitted changes
 - a review of your branch compared to a base branch like `main`
 
-Use `--base <ref>` for branch review. It also supports `--wait`, `--background`, `--scope <auto|working-tree|branch>`, and — like `/codex:rescue` — `--model <model|spark|sol|luna|astra>` to pick the reviewing model. `--effort <level>` is accepted and validated here, but the plugin does not pass it to a native review: Codex runs that review at its own reasoning effort. This review is also not steerable and takes no custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area, or when the reasoning effort has to be yours to choose.
+Use `--base <ref>` for branch review. It also supports `--wait`, `--background`, `--scope <auto|working-tree|branch>`, and — like `/codex:rescue` — `--model <model|spark|sol|luna|astra>` to pick the reviewing model. `--effort <level>` sets the review's reasoning effort: a native review sends no per-turn request that could carry it, so the plugin sets it on the review's thread instead (`model_reasoning_effort`). Without `--effort`, your `config.toml` decides. This review is not steerable and takes no custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
 
 Examples:
 
@@ -472,6 +472,7 @@ Broker and background-job lifecycle:
 | [#817](https://github.com/openai/codex-plugin-cc/pull/817) | the review context keeps the first column of `git status --short` (an unstaged change lost its leading space) and non-ASCII file names: with git's default `core.quotePath`, an untracked `café.js` was listed under a quoted name that does not exist on disk and left out of the review |
 | [#831](https://github.com/openai/codex-plugin-cc/pull/831) | a `/codex:status` table cell that already holds `\\|` no longer splits the row: the backslashes in front of a pipe are doubled before the pipe is escaped |
 | [#834](https://github.com/openai/codex-plugin-cc/pull/834) | an untracked symlink is no longer followed into the review prompt: a link to a file outside the repository put that file's contents in front of Codex |
+| [#840](https://github.com/openai/codex-plugin-cc/pull/840) | a branch review is pinned to the commits it was asked about: HEAD and the base are resolved to commits once, a tag is peeled, and Codex is told to read surrounding files with `git show <commit>:<path>`, so switching branches while a review runs no longer changes what it sees (needs git 2.24 or newer, for `--end-of-options`) |
 
 Commands and flags:
 
@@ -574,6 +575,13 @@ Beyond the imports, this fork carries fixes for defects the imports themselves s
   keeps its mode, never overwrites another temp file or backup, and retries a read that lands on
   Codex's half-written file. The Windows path handling comes from Codex's source and is not verified
   on a Windows machine
+- `/codex:review --effort <level>` reaches Codex: a native review never sends `turn/start`, the
+  request that carries a per-turn effort, so the level was validated and then dropped. It is now
+  set on the review's thread as `config.model_reasoning_effort` (adapted from
+  [#837](https://github.com/openai/codex-plugin-cc/pull/837), whose other changes this fork already
+  has in its own form; fork issue #19). The override is not verified against a real `codex` here:
+  the fork already sends `config` on `thread/start` for `--read-root`, so the field itself is known
+  to be accepted
 - the app-server typecheck (`npm run build`) passes
 
 Each of those came out of an adversarial review of the merges, re-run after every round of fixes;

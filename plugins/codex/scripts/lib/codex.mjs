@@ -167,11 +167,20 @@ function assertResumedSandbox(threadId, requestedMode, response) {
 
 /** @returns {ThreadStartParams} */
 function buildThreadParams(cwd, options = {}) {
+  const access = buildThreadAccessParams(cwd, options);
+  // A native review never calls turn/start, the only request that carries a per-turn effort, so
+  // its effort goes on the thread instead, as a config override. Merged into whatever config the
+  // access parameters already carry rather than replacing it, and only sent when set, so a request
+  // without one keeps deferring to the user's config.toml.
+  const config = options.threadEffort
+    ? { ...(access.config ?? {}), model_reasoning_effort: options.threadEffort }
+    : access.config;
   return {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    ...buildThreadAccessParams(cwd, options),
+    ...access,
+    ...(config ? { config } : {}),
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true
   };
@@ -1434,6 +1443,7 @@ export async function runAppServerReview(cwd, options = {}) {
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const thread = await startThread(client, cwd, {
       model: options.model,
+      threadEffort: options.effort ?? null,
       sandbox: "read-only",
       ephemeral: true,
       threadName: options.threadName

@@ -421,6 +421,7 @@ async function executeReviewRun(request) {
     const result = await runAppServerReview(request.cwd, {
       target: reviewTarget,
       model: request.model,
+      effort: request.effort,
       onProgress: request.onProgress
     });
     const payload = {
